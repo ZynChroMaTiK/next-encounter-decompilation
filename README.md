@@ -70,6 +70,12 @@ Not in the repo; set up locally per [`docs/toolchain.md`](docs/toolchain.md):
 - [GhidraMCP](https://github.com/LaurieWired/GhidraMCP) — `bridge_mcp_ghidra.py` goes in `tools/ghidra-mcp/`
 - [Dolphin](https://dolphin-emu.org/) (`DolphinTool`) — goes in `tools/Dolphin-x64/`
 
+## Licence
+
+Licensed under the **GNU General Public License, version 2** — see
+[`LICENSE`](LICENSE). That matches Serious Engine 1, which the port is built on
+and which is GPL v2 only.
+
 ## Legal
 
 *Serious Sam* is a trademark of Croteam. *Serious Sam: Next Encounter* was
