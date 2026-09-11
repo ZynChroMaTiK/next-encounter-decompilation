@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# Copyrighted game data — NEVER commit.
+# Serious Sam: Next Encounter is (c) Climax / Take-Two / Croteam; the disc
+# image, its extracted files, and anything converted from them stay local.
+# ---------------------------------------------------------------------------
+
+# The disc and its extracted contents (keep only the "how to populate" note).
+orig/*
+!orig/README.md
+
+# Everything the tools/ extract or convert from orig/: meshes, textures,
+# models, sounds, text, worlds, renders. All derived from the game's assets.
+build/
+
+# Ghidra project: the database embeds main.dol's bytes and disassembly.
+ghidra/*.gpr
+ghidra/*.rep/
+ghidra/*.lock
+ghidra/*.lock~
+
+# Belt and braces: disc images, executables and asset formats anywhere in
+# the tree. pc/engine and ref/ are submodules, so these never match there.
+*.rvz
+*.iso
+*.gcm
+*.gcz
+*.ciso
+*.wbfs
+*.nkit.*
+*.dol
+*.elf
+*.ssg
+*.ssw
+*.sst
+*.tdb
+*.spt
+*.spd
+*.bnr
+*.bik
+*.Gui
+StreamData.dat
+# SE1 retail archives (needed to run stock SE1; not ours to ship).
+*.gro
+
+# ---------------------------------------------------------------------------
+# Third-party tools and local environments — fetch them per docs/toolchain.md.
+# ---------------------------------------------------------------------------
+tools/Dolphin-x64/
+tools/ghidra-mcp/bridge_mcp_ghidra.py
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Generated / local clutter
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.log
+.claude/settings.local.json
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

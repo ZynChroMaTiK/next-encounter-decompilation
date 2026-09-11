@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "C:/SeriousEngine/Coding/next-encounter-decompilation/tools/ghidra-mcp/.venv/Scripts/python.exe",
+      "args": [
+        "C:/SeriousEngine/Coding/next-encounter-decompilation/tools/ghidra-mcp/bridge_mcp_ghidra.py",
+        "--ghidra-server",
+        "http://127.0.0.1:8080/"
+      ]
+    }
+  }
+}

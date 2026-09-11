@@ -1,0 +1,6 @@
+[submodule "pc/engine"]
+	path = pc/engine
+	url = https://github.com/tx00100xt/SeriousSamClassic-VK.git
+[submodule "ref/serious-engine"]
+	path = ref/serious-engine
+	url = https://github.com/Croteam-official/Serious-Engine.git
