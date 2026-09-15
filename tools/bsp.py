@@ -36,9 +36,17 @@ The other three sign/order conventions score close to zero.
                                //         u32; f32 rgb[3]} -- a projected tint
     };
 
-The collision tree's leaves list `(u16 index, u16 flags)` entries and pointers
-to brush-like records; the two trees in the header are still unidentified (they
-are *not* keyed by TouchField volume index -- tested and rejected).
+A leaf record is a convex hull (checked on all 1,194; see
+docs/world-conversion.md): {p0, p1, verts* = this+0x48, edges* (u8 pairs,
+right after the vertices), u16 nverts, u16 nedges, f32 centre[3], f32 radius}.
+
+A collision-tree leaf holds `(u16 object, u16 flags)` entries at +0x08 (count
++0x0c) and a list of records at +0x10 (count +0x14); both pointers are valid on
+all 1,114 collision leaves on the disc. Each record carries a bounding sphere
+and points back to one of its leaves at +4 (to this leaf on 1,030 of 2,140, so
+records are shared). Neither list is keyed by TouchField volume index, and the
+two trees in the header are still unidentified (*not* keyed by it either --
+tested and rejected).
 
 Usage:
     python tools/bsp.py info orig/files/Levels/Rlevel3_1.ssw

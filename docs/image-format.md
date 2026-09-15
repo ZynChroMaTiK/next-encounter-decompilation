@@ -72,7 +72,10 @@ TEV/blend state:
 struct CcMaterial {
     CcMaterial* next;      // +0x00
     CcTexture*  diffuse;   // +0x10  bound to TEV stage 0 via tex->handle
+    CcTexture*  stage6;    // +0x14  bound to stage 6 (world setup only)
     CcTexture*  second;    // +0x18  bound to stage 4
+    CcLayer*    layers;    // +0x1c  texture layers 1 and 2 (world setup), below
+    CcTexture*  lightmap;  // +0x20  the level's baked lightmap atlas, 1024x1024, stage 5 (world setup)
     u32         pass;      // +0x24  0 or 1 selects the setup path
     u32         flags;     // +0x28  bits 0/1/2 toggle three render states
     u8          modeA;     // +0x32  0/1/2
@@ -80,6 +83,123 @@ struct CcMaterial {
     void*       runtime;   // +0x48  shader object built at load
 };
 ```
+
+World meshes are set up by a longer function, `0x80134858`, which binds the
+same stage 0 but also walks `+0x1c`, binds `+0x14`, `+0x20` and `+0x34`, and
+handles the special lava and water materials. The `+0x20` texture is shared
+by nearly every material of a level: 2 to 4 distinct 1024x1024 images per
+level, packed charts with opaque alpha. They are the level's **baked
+lightmap**, below.
+
+### The lightmap atlas — `CcMaterial + 0x20` and array 7
+
+Vertex field 6 indexes array 7, 4 bytes a vertex, for the static world and
+for doors and moving brushes, whose nodes point to the atlas at `+0x68`: a big-endian u16 u and u16 v, in 1/65536ths of the material's `+0x20`
+atlas. Sampled that way, the atlas lays out as lighting over the level: lamp
+pools, the sun's shadows of walls and pillars, black interiors
+(`tools/lightmap.py render`). A texel is 0.29 world units on `Rlevel1_1`, 0.45
+on `Clevel8_2` and 1.2 on `Alevel12_3` (medians), as much as each level could
+fit into its atlases. Sampled over a door or gate polygon, its values vary
+by 9 levels within the polygon against 36 between polygons on `Rlevel1_1`:
+lighting, not noise. Array 8 is not yet read.
+
+The values are SE1 shadow map values, 127 being a surface at its texture's own
+brightness. On `Rlevel1_1`, ground the sun cannot reach holds (36,36,32), and
+the sun fill × 127.5 is (39,38,31). Sunlit ground holds that plus the sun
+colour × 127.5 × N·L: at N·L 0.8, (212,209,141) predicted and (205,203,142)
+baked. Surfaces no light reaches hold 0 on every level, and 1,022 rebuilt
+polygons are a flat 127 throughout, full bright. How it becomes SE1 lighting is in
+`docs/world-conversion.md`, "Lights".
+
+### Texture layers — `CcMaterial + 0x1c` and the label
+
+Serious Editor polygons carry three texture layers; NE kept layers 1 and 2
+in two places.
+
+**The label keeps the designers' settings.** `Mat 15 (19,16,17) 2049 2050`
+is three texture ids, then layer 1's and layer 2's settings, `-1` for an
+unused layer. The ids are the exporter's own numbering (a level's id maps
+to one texture, 1,909 of 1,913 times); a layer is present when its setting
+is not -1, not when its id is some "none" value (that id differs per level).
+A setting is **the SE1 blend index | the SE1 texture flags << 9**:
+
+| setting | blend (`WorldBase` table) | flags | layers (materials and brushes) | textures |
+|---|---|---|---|---|
+| 2049 | 1 Shade | 4 discardable | 2,871 | grey detail maps |
+| 2050 | 2 Blend | 4 | 614 | decals with alpha: grass edges, dirt patches, trim (402 of 406 measured have alpha) |
+| 3074 | 2 Blend | 6 clamp V, discardable | 373 | mostly opaque, stretched over large areas (285 of 365 measured have no alpha) |
+| 6147 | 3 Add | 12 after shadow, discardable | 190 | glows: light strips and the like |
+| 55299, 51203, 22531, 18435 | 3 Add | 4 or 12, plus `0x20`, or `0x20` and `0x40` | 158 | water caustics |
+| 6145 | 1 Shade | 12 | 35 | detail maps |
+| 2051, 6150, 2048, 99, 6146, 2054, 6144, 7170 | | | 43 | |
+
+Why `<< 9` and not `<< 8`: in the designers' `waterfallArea.wld` every layer
+has flag 4 (`BPTF_DISCARDABLE`, which brush import gives every new layer),
+detail maps are Shade with flags 4, and patches Blend with flags 4 or 6; on
+the disc `0x800` is set in every setting but one, and `2049` is the detail
+maps. Read `<< 8`, `0x1000` would be `BPTF_REFLECTION`, but its layers keep
+UV sets at a steady texel density (165 of 189 for 6147), which a reflection-
+mapped layer would not need; `<< 9` makes it `BPTF_AFTERSHADOW`, and the
+layers are glows. The two bits above SE1's five (`0x20`, `0x40`) appear only
+on Add layers with the caustics texture, and NE animates exactly those.
+
+**The records are what NE draws.** `+0x1c` heads a list of 0x18-byte
+records, one per layer drawn, in layer order:
+
+```c
+struct CcLayer {
+    CcLayer*   next;       // +0x00
+    CcTexture* texture;    // +0x04
+    u32        mode;       // +0x08  1..7, picks the TEV operation below
+    u32        word;       // +0x0c  byte 0x0e: V clamp, 0x0f: U clamp; 0x100000: after shadow
+    void*      anim;       // +0x10  modes 5 and 6: an object of type 0x65, filled at run time
+    u32        _14;
+};
+```
+
+- Mode → TEV operation (`0x80134858`): 1 → 3, 2 → 4, 3 → 6, 4 → 9, 5 → 6
+  and 6 → 7 both with texture-coordinate generation 3 (animated), 7 → 13.
+  Labelled layers give 1 for Shade, 2 Blend, 3 Add, 4 Blend with clamp V,
+  5 and 6 the caustics, 7 the one blend index 99 (a flat black texture at
+  alpha 36).
+- `0x100000` is set exactly when the label has `0x1000` (after shadow):
+  189 of 189 on 6147.
+- **Bytes `0x0f` and `0x0e` clamp U and V** (1 clamps, 2 mirrors, 0
+  repeats; the material's own `+0x33`/`+0x32` do the same for the diffuse
+  texture). They go to the U and V wrap of the layer's stage. A clamped
+  layer's UVs may span many tiles: `Clevel5_4_164` on `Rlevel1_1` is a grass
+  fringe, 128x8, its top rows transparent and its bottom row green, clamped
+  in V, so it draws one fringe along a path's edge and solid grass beyond;
+  repeating, it draws stripes. Which byte is which axis follows from that
+  texture and from layers with one byte set (26 of 81 with `0x0f` stay
+  within one tile in U, 5 in V). The label's clamp bits are not these: the
+  label clamps V on setting 3074, and NE repeats those layers. Clamped: 573
+  layer records (321 in V, 82 in U, 170 both) and the diffuse texture of 15
+  materials; where a brush node keeps its diffuse texture's wrap is not
+  known.
+- **The n-th record's UVs are TEX(n+1)** (array 5, then 6), whichever SE1
+  layer it is: a material with one record varies field 4 at a steady texel
+  density and leaves field 5 constant; with two, both vary.
+- NE drops layers it cannot draw: blend 0 (Opaque) and 6 (Add pulsating)
+  keep no record. With those left out, label and records agree on 2,962 of
+  2,966 labelled materials that have layers.
+
+**The label's order is not SE1's layer order.** Serious Engine keeps detail
+maps on the third texture (layer 2) and blends on the second, and the
+designers' `waterfallArea.wld` does (1,474 detail polygons on layer 2, every
+Blend layer on layer 1). NE's labels mix them: a lone detail map comes first
+on 1,443 materials and second on 831, and 352 put a Blend layer first and the
+detail map second. `level.layers` therefore places them by kind: Shade on
+layer 2, Blend and Add on layer 1, and when both are of one kind the label's
+first on layer 2. That leaves 353 detail maps on layer 1 (the materials with
+two) and 172 other layers on layer 2.
+
+Moving brushes (`image + 0x48`) have the same list at node `+0x64`, where
+label and records agree on 176 of 197. `level.materials` and `level.sectors`
+return each node's `"layers"`; a node with no label (40 materials, 723 brush
+nodes) or whose label and records disagree takes SE1 blend and flags from the
+record's mode. All 49 levels: 5,239 layers drawn, 4,240 of them with the
+designers' settings, every one with a texture.
 
 **Material nodes are variable-length and physically contain their own
 display-list descriptors.** That is what ties geometry to its texture: a
@@ -123,7 +243,7 @@ strings, which is what fixes the count at 13.
 | 0 | 19,359 | 12 | **positions**, float3 |
 | 3 | 2,446 | 12 | normals, float3 |
 | 4, 5, 6, 12 | 8,576 / 5,970 / 2,038 / 9,863 | 8 | texcoords, float2 |
-| 7, 8 | 39,515 / 1,114 | 4 | 4-byte entries; **7 is not vertex colour** (see below) |
+| 7, 8 | 39,515 / 1,114 | 4 | **lightmap UVs**, u16 pairs into the material's `+0x20` atlas (see "The lightmap atlas") |
 | 1, 2, 9, 10, 11 | 1–4 | 4 | tiny/constant |
 
 **Lights at `image + 0x34`** — a linked list, 84-byte nodes. The field names are
@@ -133,15 +253,16 @@ col=<..> pos=<..> dir=<..> as=%0.2f ae=%0.2f`.
 ```c
 struct CcLight {
     CcLight* next;      // +0x00
-    u32      type;      // +0x04  1 static, 2 runtime point, 3 directional
+    u32      type;      // +0x04  1 ambient, 2 point, 3 directional
     float    col[3];    // +0x08  x255 and clamped at runtime (0x8021e65c = 255.0)
     float    pos[3];    // +0x14
     float    dir[3];    // +0x20  non-zero on exactly the 48 type-3 lights
     float    as;        // +0x2c  attenuation start
     float    ae;        // +0x30  attenuation end (999999 on directional)
     u32      index;     // +0x34
-    u32      flags;     // +0x38  0, 1 or 2
-    ...                 // +0x3c on: runtime; +0x40 receives the light object
+    u32      flags;     // +0x38  0, 1, 2 (a few 3, 4, 5, 8, 11); meaning not known
+    u32      kind;      // +0x3c  0 baked into the level's lightmap; 1, 2, 3 not, below
+    ...                 // +0x40 receives the light object
 };
 ```
 
@@ -153,6 +274,16 @@ pair.
 Colour components are **signed**: negative values are subtractive "dark" lights
 used to shade areas down (`rgb = (-2.3,-2.3,-2.3)` in `Alevel9_1`). All 52 on the
 disc are negative in every component. Don't treat them as a decode error.
+
+**Only kind 0 is in the lightmap.** `+0x3c` is 0 on 14,742 lights. 13 levels
+(`Alevel10_2` to `Alevel12_3`, `Clevel7_2`, `Gallery`, `Rlevel3_4`, `Rlevel4_3`)
+list their lights twice: the second half repeats the first node for node, byte
+for byte except `+0x3c`, which is 2 there (5,439 lights). 2 also marks three
+lights of their own, 3 one light on each of 25 levels, and 1 one sun on
+`Clevel5_3`. Re-baked without its kind-2 lights, `ClevelDM_1`'s lightmap
+matches NE's on 84% of pixels instead of 0.1%, and `RlevelDM_3`'s on 79%
+instead of 35%. Without the kind-3 light, `Rlevel0_1` and `Rlevel3_2` match a
+point or two better (`docs/world-conversion.md`, "Lights").
 
 How each type is used, and how they map onto SE1's `Light` entity, is in
 `docs/world-conversion.md`.
@@ -288,6 +419,8 @@ struct CcSector {              // image + 0x48
     Mtx*       xform;          // +0x08  places the local-space vertices
     ...
     CcTexture* diffuse;        // +0x58  its own material, like CcMaterial
+    CcLayer*   layers;         // +0x64  texture layers 1 and 2, as CcMaterial+0x1c
+    CcTexture* lightmap;       // +0x68  the level's lightmap atlas (46 of 62 on Rlevel1_1)
     ...                        //        plus its own display-list descriptors
 };
 ```
@@ -300,8 +433,9 @@ texture, exactly as a `CcMaterial` node does.
 
 Disc-wide the owner is not always a Mover: **all 958 Movers and all 116
 DestroyableArch entities** own an `image+0x48` brush this way, and 135 brushes
-have no owning entity. Of the 1,209 nodes, 15 have no render triangles and are
-collision-only.
+have no owning entity. Of the 1,209 nodes, 15 are empty: no render
+triangles and no collision. Each node's `+0x28` points at its collision mesh
+record (`tools/collision.py`).
 
 Verified against the entity list: after transforming, **1,048 of 1,059 Mover
 pivots across all 49 levels fall inside their own geometry's bounding box**.
@@ -418,7 +552,7 @@ often enough to make this reliable.
 | 3100 / 3200 / 3201 | weapon / ammo / ammo pack | 182 / 2005 / 68 |
 | 3210 / 3215 / 3220 | key / treasure / powerup | 26 / 454 / 41 |
 | 4010 | Copier (clones another entity) | 874 |
-| 4020 / 4060 | Teleport / its target marker | 65 / 76 |
+| 4020 / 4060 | Teleport / its target, a plain `Marker` | 65 / 76 |
 | 4030 | Watcher (checkpoint/condition) | 1148 |
 | **4040** | **Wave spawner** | **6665** |
 | 4050 | DoorController | 26 |
@@ -426,14 +560,35 @@ often enough to make this reliable.
 | 4080 | Trigger | 3632 |
 | 4090 / 4100 | Music / SoundHolder (sample + speech) | 47 / 213 |
 | 4110 / 4120 / 4130 | Damager / Camera / MessageHolder | 134 / 171 / 63 |
-| 4140 / 4150 / 4160 | PlayerStart / Marker / WorldLink | 456 / 2079 / 42 |
+| 4140 / 4150 / 4160 | PlayerStart / EnemyMarker (patrol and path points) / WorldLink | 456 / 2079 / 42 |
 | 4170 / 4180 / 4190 | TouchField / Switch / Vehicle | 444 / 47 / 8 |
 | 4200 / 4210 / 4220 / 4240 | Prop / ModelDestruction / Bouncer / DestroyableArch | 1443 / 101 / 64 / 116 |
 | 4260 / 4270 / 4280 | Arrow / LockDown / WarpPlayers | 156 / 116 / 148 |
 | 4310 / 4320 / 4330 / 4340 | ParticleHolder / Flag / LevelPar / FMVPlayer | 210 / 6 / 42 / 14 |
 | **5000** | **Enemy template** | **1866** |
 | 5010 | light flare | 28 |
-| 4230, 5020, 6002 | unidentified (6002 is one per level) | 1 / 23 / 26 |
+| 4230 | RollingStone (the rolling boulder) | 1 |
+| 5020, 6002 | not built by the entity factory: 5020 are force fields (`docs/world-conversion.md`), 6002 is one per level | 23 / 26 |
+
+**The class ids are the game's own.** `EntityFactory_Create` (`0x8010d8e0`)
+switches on them and builds one runtime class per id. Each class's init logs
+`== <Name>`, and those names settle the table:
+- **The pairs:**
+  - 4010 Copier, 4020 Teleport, 4030 WatchPlayers, 4040 EnemySpawner;
+  - 4050 DoorController, 4060 Marker, 4070 MovingBrush, 4080 Trigger;
+  - 4090 MusicChanger, 4100 SoundHolder, 4110 Damager, 4120 Camera;
+  - 4130 MessageHolder, 4140 PlayerMarker, 4150 EnemyMarker, 4160 WorldLink;
+  - 4170 Touchfield, 4180 Switch, 4190 Vehicle, 4200 ModelHolder2;
+  - 4210 ModelDestruction, 4220 Bouncepad, 4230 RollingStone,
+    4240 DestroyableArchitecture;
+  - 4260 Arrow, 4270 Lockdown, 4280 WarpPlayers, 4310 ParticlesHolder;
+  - 4330 ParWatcher, 4340 FMVPlayer.
+- **Special cases:**
+  - 4320 MPFlag is built only in game mode 3.
+  - 4290 and 4300 log "Obsolete cutscene entity found".
+- **Built elsewhere:** the pickups, 5000, 5010, 5020 and 6002.
+- **In Ghidra:** the constructors and inits are named `Cc<Name>_ctor` /
+  `Cc<Name>_Init`.
 
 #### How enemies are placed
 
@@ -508,7 +663,8 @@ MessageHolder carries a **localisation key** — `NETRISCA_RLEVEL_1_1_INTRO`,
 reads it. The text comes from two hashes, at `props + 0x04` (body) and
 `+ 0x0c` (title), looked up in the `.tdb` (`docs/text.md`). Key carries an
 asset path (`\items\Level\Rlevel1_1_Tollgate_coins`). Camera (up to 1368 bytes)
-appends spline data that is still unread. Mover (up to 776) appends its
+appends its `CameraMarker` chain, typed in `docs/world-conversion.md`
+("Cameras"). Mover (up to 776) appends its
 keyframes: a linked list of 0x58-byte keys, each with a time, a wait, a stop
 flag and a full matrix. It is typed in `docs/world-conversion.md` ("Mover
 motion"), from the game's own `MovingBrush` code.
@@ -636,6 +792,14 @@ pointer, so the earlier "103 nodes" count was an artifact of walking it as one.
 `+0x70` (6 nodes) is a second material list. The `+0x48` list is typed above;
 what remains unread inside those nodes is the pointer to the position array at
 `+0x2a4` and a tail of packed 16-bit values.
+
+`+0x50` points to the level's **collision mesh** (`tools/collision.py`). It
+holds vertices, and 10-byte triangles `{u16 flags; u16 v[3]; u16 value}`:
+- **Solid:** flags are `0x1f` on 98.5% of triangles.
+- **Trigger:** bit 0x40 marks a TouchField's trigger volume, with the field's
+  index in the low byte of `value`.
+
+`docs/world-conversion.md` ("TouchField and Bouncer") has the full layout.
 
 `+0x74` holds the level's **BSP trees** (`tools/bsp.py`): a plane pool —
 records of a pointer to a shared unit normal plus a distance, 7,838 of them
@@ -880,28 +1044,32 @@ Characters use one kind or both:
 
 ### Still open for the models
 
-1. **Unbound vertices.** 50 animated model instances on the disc draw
-   vertices that no skin group names and no type-0 list carries: KleerKnight
-   807 of 1,409, merman 49 of 513, TweedleDumDum 19 of 591. They stay in
-   the bind pose, and posed renders tear.
-   - On KleerKnight they are whole parts: the torso armour, most spikes,
-     and all four hooves. Yet a `R_Rear_Hoof` bone exists and lists 18
-     weighted vertices.
-   - There are no duplicate positions and no other index arrays that cover
-     them.
-   - The game's own skinner does not explain them. `CcMesh_SkinCPU` zeroes
-     its destination and writes only vertices that its groups name, so by
-     that path these vertices would sit at the model origin, which is
-     surely not what the game shows.
-   - So they are drawn from somewhere this path does not write, or bound
-     through data not yet found. The draw call that binds the skinned
-     buffer is the place to look next.
+1. ~~**Unbound vertices.**~~ **Explained by the developer sources**
+   (`docs/dev-material.md`). The 50 instances are 3 models: KleerKnight
+   (807 of 1,409), merman (49 of 513) and TweedleDumDum (19 of 591). On
+   each, the skinned vertices are a prefix of the position array, and the
+   tail after it is a mesh the skin records don't cover:
+   - merman's and TweedleDumDum's tails are **rigid propellers**, parented
+     to `propellor` and `Prop` bones that NE dropped;
+   - KleerKnight's is a second, newer body mesh whose weights never made
+     it in.
+   The skinner zeroes the whole position array. If the instance buffer
+   mirrors the model's pos `CcArray`, whose byte size covers all
+   positions, the tail collapses to the origin every frame and is never
+   seen. That is likely, but the code that builds the buffer isn't found
+   yet. The port can drop the tail, or rebind it from the source
+   (`tools/clm.py`).
 2. **Locators.** Records like `Locator_Lhand` → bone 19 + a matrix are
-   attachment points (weapons, effects). They are unread beyond that.
+   attachment points (weapons, effects). The sources carry them as
+   `locator*` bones with `LocatorID` chunks, which is the way in.
 3. **Which SE1 form.** SE1 `.mdl` models are vertex-animated, and SKA is
-   skeletal. The keys bake straight into per-frame vertex positions, which
-   is the easy route to `.mdl`. SKA would need a skeleton this format does
-   not store. That decision belongs with the Stage 2 writer.
+   skeletal.
+   - The keys bake straight into per-frame vertex positions, which is the
+     easy route to `.mdl`.
+   - SKA needs a skeleton. NE's format doesn't store one, but the `.clm`
+     sources do, as nested bones with bind matrices, for every character
+     that has a source.
+   That decision belongs with the Stage 2 writer.
 
 ## `CcTexture` — typed
 
@@ -977,7 +1145,8 @@ An earlier sweep reported only 157 nodes; that was the glob layout applied to
 5. ~~The `.clm` mesh format~~ — done. `CcMesh` at `image+0x5c`, GX vertex
    type 2, damage stages; see "The mesh data — typed" above and
    `tools/model.py`.
-6. Camera tails - spline data, the last big unread blob inside entity props.
+6. ~~Camera tails~~ — done: SE1's `CameraMarker` chain, packed
+   (`docs/world-conversion.md`, "Cameras").
    (Mover keyframes are done: `docs/world-conversion.md`, "Mover motion".)
 7. ~~Object models~~ — geometry done: embedded nested images, vertex types
    0 and 5, `tools/objmodel.py`. Skinning, hierarchy and animation are open;

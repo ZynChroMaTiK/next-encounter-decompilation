@@ -44,6 +44,8 @@ from entity import entities, _fill_tri, _decode                  # noqa: E402
 from gxtex import walk as texwalk, write_png                     # noqa: E402
 from bsp import region_cells                                     # noqa: E402
 from model import Level as ModelLevel                            # noqa: E402
+import space                                                     # noqa: E402
+from collision import bouncer_volumes, brush_meshes, touch_volumes                              # noqa: E402
 
 # SE1 sector content types, from EntitiesMP/WorldBase.es.
 AIR, WATER, LAVA = 0, 1, 2
@@ -58,8 +60,20 @@ MAT_LIQUID, MAT_WATER_TAG, MAT_LAVA_TAG = 0x28, 0x3C, 0x40
 # NE's water region leaves carry exactly 13 in the byte after the content type.
 UNDERWATER = 13
 
-# main.dol 0x8021e65c: the runtime light path multiplies by 255.0 and clamps.
-COLOUR_SCALE = 255.0
+# NE's colour is the light's SE1 colour byte / 127.5, not / 255. The level's
+# baked lightmap (the 1024x1024 atlas at CcMaterial+0x20, docs/image-format.md)
+# is an SE1 shadow map: surfaces the sun cannot reach hold the sun fill x 127.5
+# ((39,38,31) predicted, (36,36,32) baked on Rlevel1_1) and sunlit floors that
+# plus sun x 127.5 x N.L, within a few levels (docs/world-conversion.md,
+# "Lights"). 1.0 is SE1's neutral 127, so 10,825 colours over 1.0 are not
+# overbright. The runtime path's 255.0 (main.dol 0x8021e65c) only lights models.
+COLOUR_SCALE = 127.5
+
+# NE's light type (CcLight +0x04) -> EntitiesMP/Light.es LightType. Type 1 is
+# SE1's ambient light: no shadows, no angle term. Baked that way, the lamp
+# glows NE's lightmap shows come out (docs/world-conversion.md, "Lights").
+# Type 2 is a point light: its shadows are in the lightmap.
+NE_LIGHT_TYPES = {1: "LT_AMBIENT", 2: "LT_POINT", 3: "LT_DIRECTIONAL"}
 
 MOVER_CLASS = 4070
 FORCE_CLASS = 5020
@@ -127,14 +141,14 @@ def se1_light(l):
     t = l["type"]
     props = {
         "Name": "NE light %d" % l["index"],
-        "Type": "LT_DIRECTIONAL" if t == 3 else "LT_POINT",
+        "Type": NE_LIGHT_TYPES[t],
         "Color": rgb,
         "Dark light": dark,
         "Dynamic": False,
     }
     out = {"position": list(l["pos"]), "props": props,
            "ne": {"type": t, "index": l["index"], "flags": l["flags"],
-                  "colour": [r, g, b], "clamped": max(mag) > 1.0}}
+                  "colour": [r, g, b], "clamped": max(mag) * COLOUR_SCALE > 255.5}}
     if t == 3:
         # Writer: DirectionVectorToAngles(dir) -> orientation. SE1 lights a
         # model from pos - dir*1000, so dir is the direction light travels,
@@ -153,31 +167,67 @@ def se1_light(l):
     return out
 
 
+def _drop_unbaked(raw, ls):
+    """Only lights with 0 at +0x3c are in the level's baked lightmap.
+
+    13 levels list every light twice, the second half repeating the first
+    node for node with 2 at +0x3c (5,439 lights). The same 2 marks 3 lights
+    of their own, and re-baked without them ClevelDM_1 matches NE's lightmap
+    on 84% of pixels instead of 0.1%, RlevelDM_3 on 79% instead of 35%. 3
+    marks one light on 25 levels (without it Rlevel0_1 and Rlevel3_2 match a
+    point or two better), 1 a sun that lights nothing (Clevel5_3)."""
+    seen = set()
+    for r, l in zip(raw, ls):
+        key = (r["type"], r["index"], r["colour"], r["pos"], r["dir"],
+               r["att_start"], r["att_end"], r["flags"])
+        if r["kind"] == 0:
+            seen.add(key)
+        elif key in seen:
+            l["skip"] = "second copy of NE light %d (+0x3c = %d)" % (r["index"], r["kind"])
+        else:
+            l["skip"] = "+0x3c = %d: not in the baked lightmap" % r["kind"]
+
+
+def _drop_unlit_suns(ls):
+    """Two directional lights, white with no fill and pointing exactly level
+    (Alevel12_3, Alevel12_4; Clevel5_3's is marked unbaked), leave no trace
+    in the baked lightmap: on Alevel12_3 surfaces facing one would hold 127
+    and hold 0. Converted, one would light every wall facing it."""
+    for l in ls:
+        if ("direction" in l and not l.get("skip") and abs(l["direction"][1]) < 1e-6
+                and not any(l["props"].get("Directional ambient", (0, 0, 0)))):
+            l["skip"] = "horizontal directional light with no ambient: not in the baked lightmap"
+
+
 def _fold_sun_fills(ls):
     """A level's sun is authored as a pair: a directional light and a type-1
-    fill with infinite reach (as = ae = 999999) at exactly the same position.
-    All 48 such fills on the disc sit on a directional light. SE1 expresses
-    that pair as ONE directional Light whose "Directional ambient" is the fill:
-    SetupLightSource copies m_colAmbient only for directional lights. So the
-    fill folds into its partner instead of becoming a point light that would
-    light the whole world from one spot.
+    (ambient) fill with infinite reach (as = ae = 999999) at exactly the same
+    position. All 48 such fills on the disc sit on a directional light. SE1
+    expresses that pair as ONE directional Light whose "Directional ambient"
+    is the fill: SetupLightSource copies m_colAmbient only for directional
+    lights. So the fill folds into its partner instead of becoming an ambient
+    light with no shadows that would light the whole world, where NE's
+    lightmap is black indoors.
     """
-    dirs = [l for l in ls if "direction" in l]
+    dirs = [l for l in ls if "direction" in l and not l.get("skip", "").startswith("second copy")]
     used = set()
     for l in ls:
-        if l["ne"]["type"] != 1 or l["props"].get("Fall-off", 0) < 1e5:
+        if l.get("skip") or l["ne"]["type"] != 1 or l["props"].get("Fall-off", 0) < 1e5:
             continue
         mate = next((d for d in dirs if id(d) not in used and all(
             abs(a - b) < 1e-3 for a, b in zip(d["position"], l["position"]))),
             None)
-        if mate:
+        if mate and mate.get("skip"):
+            used.add(id(mate))
+            l["skip"] = ("fill of directional light %d, which is not in the baked lightmap"
+                         % mate["ne"]["index"])
+        elif mate:
             used.add(id(mate))
             mate["props"]["Directional ambient"] = l["props"]["Color"]
             mate["ne"]["ambient_from"] = l["ne"]["index"]
             l["skip"] = ("folded into directional light %d as its ambient"
                          % mate["ne"]["index"])
-        else:                        # none on the disc; kept as a fallback
-            l["props"]["Type"] = "LT_AMBIENT"
+        else:                        # none on the disc; stays an ambient light
             l["ne"]["unpaired_fill"] = True
 
 
@@ -339,6 +389,264 @@ def message_description(ents, stem):
     return out
 
 
+CAMERA_CLASS = 4120
+
+
+def se1_rotation(h, p, b):
+    """SE1's MakeRotationMatrix (Engine/Math/Geometry.cpp), angles in degrees."""
+    h, p, b = (math.radians(x) for x in (h, p, b))
+    sh, ch, sp, cp, sb, cb = (math.sin(h), math.cos(h), math.sin(p),
+                              math.cos(p), math.sin(b), math.cos(b))
+    return [[ch * cb + sp * sh * sb, sp * sh * cb - ch * sb, cp * sh],
+            [cp * sb, cp * cb, -sp],
+            [sp * ch * sb - sh * cb, sp * ch * cb + sh * sb, cp * ch]]
+
+
+def ne_rotation(h, p, b):
+    """SE1 editor angles -> the rotation rows of the Mtx Climax's converter
+    wrote for them: MakeRotationMatrix at (180 - h, p, -b), which is
+    S_z . R(h, p, b) . S_x. Exact on every camera and marker placement on the
+    disc; tools/space.py takes it back to R(h, p, b)."""
+    return se1_rotation(180.0 - h, p, -b)
+
+
+def camera_description(ents):
+    """NE cameras (class 4120) -> SE1 Camera + a CameraMarker chain.
+
+    Built in NE space like everything else here, then taken to the original
+    space by describe(): the position is the marker's placement translation
+    (what the game reads), and the rotation is built from its stored angles.
+    On records that carry their own Mtx that equals the Mtx, and in the
+    original space it is the editor's own MakeRotationMatrix(h, p, b). Bias
+    and continuity are 0 on the whole disc, which of +0x24 / +0x28 is which
+    is therefore moot."""
+    ids = {e["id"] for e in ents}
+    out = []
+    for e in ents:
+        if e["cls"] != CAMERA_CLASS or "markers" not in e:
+            continue
+        ms = e["markers"]
+        rec = {"entity_id": e["id"], "name": e["name"],
+               "position": list(e["pos"]) if e["pos"] else None,
+               "rotation": ne_rotation(*e["angles"]), "angles": e["angles"],
+               "static": not ms,
+               "loops": e["loops"],
+               "se1": {"class": "Camera", "Name": e["name"], "FOV": e["fov"],
+                       "Time": e["time"], "Target": 0 if ms else None},
+               "markers": []}
+        for i, m in enumerate(ms):
+            nxt = i + 1 if i + 1 < len(ms) else (0 if e["loops"] else None)
+            rec["markers"].append({
+                "position": list(m["pos"]) if m["pos"] else None,
+                "rotation": ne_rotation(*m["angles"]), "angles": m["angles"],
+                "own_matrix": m["own_matrix"], "placement_rot": m["placement_rot"],
+                "trigger_resolves": None if m["trigger"] is None else m["trigger"] in ids,
+                "se1": {"class": "CameraMarker", "Delta time": m["delta_time"],
+                        "Tension": m["tension"], "Bias": 0.0, "Continuity": 0.0,
+                        "Stop moving": m["stop_moving"],
+                        "Skip to next": m["skip_to_next"], "FOV": m["fov"],
+                        "Trigger": m["trigger"], "Target": nxt}})
+        out.append(rec)
+    return out
+
+
+SE1_ENTITIES = Path(__file__).resolve().parent.parent / "pc" / "engine" / "SamTSE" / "Sources" / "EntitiesMP"
+_ENUMS = {}
+
+
+def se1_enum(source, enum):
+    """{label: value, NAME: value} of `enum` in EntitiesMP/<source>.es."""
+    key = (source, enum)
+    if key not in _ENUMS:
+        body = (SE1_ENTITIES / (source + ".es")).read_text(encoding="latin-1")
+        m = re.search(r"^enum\s+%s\s*\{(.*?)^\};" % enum, body, re.S | re.M)
+        vals = {}
+        for num, name, label in re.findall(r'^\s*(\d+)\s+(\w+)\s+"([^"]*)"', m.group(1) if m else "", re.M):
+            vals[label] = vals[name] = int(num)
+        _ENUMS[key] = vals
+    return _ENUMS[key]
+
+
+# The item classes and the enum each one's Type takes.
+ITEM_ENUM = {"HealthItem": ("HealthItem", "HealthItemType"),
+             "ArmorItem": ("ArmorItem", "ArmorItemType"),
+             "AmmoItem": ("AmmoItem", "AmmoItemType"),
+             "WeaponItem": ("WeaponItem", "WeaponItemType"),
+             "PowerUpItem": ("PowerUpItem", "PowerUpItemType")}
+ITEM_CLASSES = {2100, 2200, 3100, 3200, 3201, 3210, 3220}
+# NE entity classes script_description leaves out, and why.
+NOT_SCRIPTED = {
+    3215: "SE1 has no scoring pickups",
+    4260: "GameCube-only objective arrow",
+    4270: "GameCube-only lockdown",
+    4280: "GameCube-only warp of every player to a start",
+    4330: "GameCube-only par times and medal scores",
+    4340: "GameCube-only movie player",
+    4320: "SE1 has no CTF flag",
+    4190: "SE1 has no drivable vehicles",
+    4180: "SE1's Switch is a model holder; NE's switch model is not converted",
+    4310: "NE's particle types are its own; not mapped yet",
+    4200: "props are not written yet",
+    4210: "props are not written yet",
+    4230: "props are not written yet",
+    5010: "light flares are not mapped yet",
+}
+LEVEL_STEMS = {p.stem.lower(): p.stem for p in
+               (Path(__file__).resolve().parent.parent / "orig" / "files" / "Levels").glob("*.ssw")}
+
+
+def _item(e):
+    """(SE1 class, Type value or None, confidence) of a pickup, from the judged
+    tables in tools/sediff.py; (None, None, reason) when SE1 has no such item."""
+    from sediff import ITEM_MAP, ITEM_MAP_BY_ID
+    from entity import ITEM_TYPES
+    idx = e.get("item")
+    if idx is None:
+        return None, None, "no item type"
+    cls, label, conf = (ITEM_MAP.get(ITEM_TYPES[idx], (None, None, "none")) if idx < len(ITEM_TYPES)
+                        else ITEM_MAP_BY_ID.get(idx, (None, None, "none")))
+    if cls is None:
+        return None, None, "SE1 has no %s" % e.get("item_name")
+    if cls in ITEM_ENUM:
+        if label is None:
+            return None, None, "%s resolves to a game-mode slot, not a type" % e.get("item_name")
+        return cls, se1_enum(*ITEM_ENUM[cls])[label], conf
+    return cls, None, conf
+
+
+# NE's creatures ported to SE1 classes of their own (pc/entities, docs/enemies.md),
+# named as the designers named them in their Entities.dll.
+PORTED_ENEMIES = {"e_DumDumLarge": "GCEnemyGenericDumDumLarge"}
+
+# The property that picks a stand-in's variant, and its enum.
+ENEMY_SUBTYPE = {"Headman": ("Type", "HeadmanType"), "Walker": ("Character", "WalkerChar"),
+                 "Scorpman": ("Type", "ScorpmanType")}
+
+
+def _enemy(e):
+    """(SE1 class, {property: value}, confidence, NE actor) of an enemy
+    template, from tools/sediff.py's judged table; class None when TSE has no
+    such creature and it is to be ported."""
+    from sediff import ENEMY_MAP, actor_enums
+    actor = actor_enums().get(e.get("model"))
+    if actor is None:
+        return None, {}, "no actor", e.get("model_name")
+    name, enum = actor
+    if enum in PORTED_ENEMIES:
+        return PORTED_ENEMIES[enum], {}, "ported", name
+    cls, sub, conf, _note = ENEMY_MAP.get(enum, (None, None, "none", ""))
+    props = {}
+    if cls in ENEMY_SUBTYPE and sub:
+        prop, en = ENEMY_SUBTYPE[cls]
+        props[prop] = se1_enum(cls, en)[sub]
+    return cls, props, conf, name
+
+
+def script_description(ents):
+    """NE's scripting and pickups -> the SE1 classes that do the same
+    (docs/world-conversion.md, "Scripting as written"). Each record keeps its
+    NE id; `links` name an SE1 entity property and the NE id it points at, and
+    the writer resolves them against every entity it writes. A Trigger slot
+    keeps NE's event (trigger / on / off): which SE1 event that is depends on
+    what the target listens for, which the writer knows."""
+    out, skipped = [], Counter()
+    for e in ents:
+        cls, k, L = e["cls"], e["kind"], e.get("links") or {}
+        if not e["pos"]:
+            continue
+        rec = {"entity_id": e["id"], "name": e["name"], "kind": k,
+               "position": list(e["pos"]), "rows": [list(r) for r in e["rot"]],
+               "links": []}
+        props = {}
+        if cls == 4080:
+            se, props = "Trigger", {"Name": e["name"], "Active": e.get("active") is not False,
+                                    "Count use": bool(e.get("use_count")), "Count": e.get("count", 1),
+                                    "Max trigs": e.get("max_trigs", -1), "Wait": e.get("wait", 0.0)}
+            for n, t in enumerate(e.get("targets") or [], 1):
+                rec["links"].append({"property": "Target %02d" % n, "id": t["target"],
+                                     "event_property": "Event type Target %02d" % n,
+                                     "event": t["event"]})
+        elif cls == 4150:
+            se, props = "EnemyMarker", {"Name": e["name"]}
+            rec["links"].append({"property": "Target", "id": L.get("next")})
+        elif cls == 4060:
+            se, props = "Marker", {"Name": e["name"]}
+        elif cls == 4030:
+            # SE1's WatchPlayers sends its close event to Owner/Target every
+            # Wait time while a player is within Watch distance; its far event
+            # is cleared, since NE's watcher has one target and one event.
+            se, props = "WatchPlayers", {"Name": e["name"], "Active": e.get("active") is not False,
+                                         "Watch distance": e.get("distance", 100.0),
+                                         "Wait time": e.get("wait", 0.1),
+                                         "Far Event type": se1_enum("Global", "EventEType")["EET_IGNORE"]}
+            rec["links"].append({"property": "Owner/Target", "id": L.get("target")})
+        elif cls == 4010:
+            se, props = "Copier", {"Name": e["name"]}
+            rec["links"].append({"property": "Target", "id": L.get("target")})
+        elif cls == 4110:
+            se, props = "Damager", {"Name": e["name"], "Ammount": e.get("amount", 1000.0)}
+            rec["links"].append({"property": "Entity to Damage", "id": L.get("entity")})
+        elif cls == 4020:
+            se, props = "Teleport", {"Name": e["name"], "Active": e.get("active") is not False,
+                                     "Width": e.get("width", 2.0), "Height": e.get("height", 3.0)}
+            rec["links"].append({"property": "Target", "id": L.get("target")})
+        elif cls == 4050:
+            # all 26 on the disc are type 1, DT_TRIGGERED in SE1's own order
+            se, props = "DoorController", {"Name": e["name"], "Active": e.get("active") is not False,
+                                           "Width": e.get("width", 2.0), "Height": e.get("height", 3.0),
+                                           "Type": e.get("type", 0)}
+            rec["links"] += [{"property": "Target1", "id": L.get("target1")},
+                             {"property": "Target2", "id": L.get("target2")}]
+        elif cls == 4140:
+            se, props = "PlayerMarker", {"Name": e["name"]}
+        elif cls == 4160:
+            world = LEVEL_STEMS.get((e.get("world") or "").lower())
+            if not world:
+                skipped["WorldLink: " + ("ends the game (endofgame)" if e.get("end_game")
+                                         else "names no level")] += 1
+                continue
+            # all 41 set are type 2, WLT_RELATIVE in SE1's own order
+            se, props = "WorldLink", {"Name": e["name"], "World": "Levels\\NextEncounter\\%s.wld" % world,
+                                      "Type": e.get("type") or 2}
+            rec["end_game"] = e.get("end_game")
+        elif cls == 4040:
+            se, props = "EnemySpawner", {"Name": e["name"], "Count total": e.get("count", 1),
+                                         "Delay initial": e.get("delay", 0.0),
+                                         "Delay single": e.get("interval", 0.1)}
+            rec["links"] += [{"property": "Template Target", "id": L.get("template")},
+                             {"property": "Patrol target", "id": L.get("patrol")}]
+        elif cls == 5000:
+            # A template the spawners copy (EnemySpawner "Template Target").
+            # Stand-ins where TSE has the creature (docs/world-conversion.md,
+            # "Enemies"); the rest wait on their port.
+            se, sub, conf, actor = _enemy(e)
+            if se is None:
+                skipped["EnemyTemplate: %s, to be ported" % actor] += 1
+                continue
+            props = dict({"Name": e["name"], "Template": True}, **sub)
+            rec["enemy"] = {"ne": actor, "confidence": conf}
+            rec["links"].append({"property": "Death target", "id": L.get("death_target"),
+                                 "event_property": "Death event type", "event": "trigger"})
+        elif cls in ITEM_CLASSES:
+            se, value, conf = _item(e)
+            if se is None:
+                skipped["%s: %s" % (k, conf)] += 1
+                continue
+            props = {"Name": e["name"]}
+            if value is not None:
+                props["Type"] = value
+            rec["item"] = {"ne": e.get("item_name"), "confidence": conf}
+            rec["links"].append({"property": "Target", "id": L.get("target")})
+        else:
+            if cls in NOT_SCRIPTED:
+                skipped["%s: %s" % (k, NOT_SCRIPTED[cls])] += 1
+            continue
+        rec["links"] = [x for x in rec["links"] if x["id"] is not None]
+        rec["se1"] = dict(props, **{"class": se})
+        out.append(rec)
+    return {"entities": out, "skipped": dict(skipped)}
+
+
 def mover_motion(d):
     """NE MovingBrush -> SE1 MovingBrush properties plus one MovingBrushMarker
     per keyframe, chained in order and looped from the last back to the first,
@@ -380,28 +688,43 @@ def mover_motion(d):
 
 
 def field_entities(container, ents):
-    """TouchField and Bouncer: SE1 brush entities whose NE volume is not in
-    image+0x48 -- nothing there points at them, their matrices are unit
-    scale, and their props carry no extents. Both do carry an index at
-    props+0x10 that counts 0, 1, 2 ... per level, and 30 of the 40 levels with
-    touch fields hold a table under root +0x74 (a plane-set structure) with
-    exactly one entry per field. The volume stays null until that is proven.
+    """TouchField and Bouncer: SE1 brush entities. A TouchField's volume is
+    the group of trigger triangles (flag 0x40) in the level collision mesh
+    whose value names its props+0x10 index (tools/collision.py); 428 of the
+    444 fields have one, a closed mesh in world space. A Bouncer's is the
+    group of solid pad triangles whose value is 0x200 | its index; 64 of 64
+    have one, 29 closed.
     """
     img = container.image
     ids = {e["id"] for e in ents}
+    vols = touch_volumes(container)
+    bvols = bouncer_volumes(container)
     tf, bo = [], []
     for e in ents:
         if e["cls"] == TOUCHFIELD_CLASS and e["props_size"] >= 36:
             w = [u32(img, e["props"] + i * 4) for i in range(9)]
             link = None if w[3] == 0xFFFFFFFF else w[3]
+            vol = vols.get(w[4])
+            se1 = {"class": "TouchField", "Enter Target": link if link in ids else None,
+                   # the init sets its active flag from props +0x00
+                   "Active": bool(w[0]),
+                   # props words 5 and 6 ride on the volume's collision
+                   # triangles (bits 4 and 8 of their value): SE1 GC's two
+                   # collision properties, by that and by their order (likely)
+                   "Block Walking Enemy": bool(w[5]), "Block Flying Enemy": bool(w[6])}
             tf.append({
                 "entity_id": e["id"], "name": e["name"],
                 "position": list(e["pos"]) if e["pos"] else None,
-                "se1": {"class": "TouchField",
-                        "Enter Target": link if link in ids else None},
+                "se1": se1,
                 "target_resolves": link in ids if link is not None else None,
-                "volume_index": w[4], "volume": None,
-                "raw": w,     # +0x00/+0x04 look like Active/Players-only: unconfirmed
+                "volume_index": w[4],
+                # The field's trigger triangles from the level collision mesh,
+                # in world space: the brush's geometry. describe() converts
+                # them to the original space like every other vertex list.
+                "volume": ({"vertices": vol["vertices"], "faces": vol["faces"],
+                            "closed": vol["closed"], "geometry_space": "world"}
+                           if vol else None),
+                "raw": w,
             })
         elif e["cls"] == BOUNCER_CLASS and e["props_size"] >= 32:
             f = [f32(img, e["props"] + i * 4) for i in range(3)]
@@ -412,13 +735,20 @@ def field_entities(container, ents):
             # so no SE1 angle convention is guessed here.
             h, pt = math.radians(f[1]), math.radians(f[2])
             vec = [-math.sin(h) * math.cos(pt), math.sin(pt), math.cos(h) * math.cos(pt)]
+            k = u32(img, e["props"] + 0x10)
+            vol = bvols.get(k)
             bo.append({
                 "entity_id": e["id"], "name": e["name"],
                 "position": list(e["pos"]) if e["pos"] else None,
                 "se1": {"class": "Bouncer", "Speed": f[0]},
                 "direction": vec,
                 "ne": {"speed": f[0], "heading": f[1], "pitch": f[2]},
-                "volume_index": u32(img, e["props"] + 0x10), "volume": None,
+                "volume_index": k,
+                # The pad's solid collision triangles (value 0x200 | index), in
+                # world space. Often open: a quad, or a box without its bottom.
+                "volume": ({"vertices": vol["vertices"], "faces": vol["faces"],
+                            "closed": vol["closed"], "geometry_space": "world"}
+                           if vol else None),
             })
     return {"touch_fields": tf, "bouncers": bo}
 
@@ -531,7 +861,8 @@ def region_description(container):
     Each cell is a closed convex volume, which is exactly what an SE1 content
     sector must be. Sector flags: content (Water 1 / Lava 2), environment
     (Underwater 13) and a haze *slot*. Slot 0 is kept empty so a sector with
-    no haze can point at it -- WorldBase.m_penHaze0..9 are the slots.
+    no haze can point at it -- WorldBase.m_penHaze0..4 are the slots (TSE),
+    and no level uses more than 2.
     """
     cells = region_cells(container)
     haze, slot_of = [], {}
@@ -646,6 +977,7 @@ def describe(container, path):
     ents = entities(container)
     mtx_to_entity = {u32(img, e["offset"] + 0x04): e for e in ents}
     brushes = []
+    bmesh = brush_meshes(container)
     for s in sectors(container):
         if not s["xform"]:
             continue
@@ -654,20 +986,31 @@ def describe(container, path):
         owner = mtx_to_entity.get(u32(img, s["offset"] + SEC_XFORM))
         kind = liquid_kind(img, ptrs, s)
         brushes.append({
-            # 15 brushes on the disc have no render triangles: collision-only
-            # volumes, not in the OBJ, so they carry no group.
+            # 15 brushes on the disc are empty: no render triangles, and a
+            # collision record with no vertices. Their owners work as logic,
+            # so they carry no group and no geometry.
             "group": ("sector%d" % s["index"]) if n else None,
             "invisible": not n,
             "name": owner["name"] if owner else ("sector%d" % s["index"]),
             "class": BRUSH_CLASS.get(owner["cls"] if owner else None, "WorldBase"),
             "entity_id": owner["id"] if owner else None,
             "entity_class": owner["kind"] if owner else None,
-            "matrix": {"rows": [list(r) for r in rows],
+            # a brush node's rotation: its local space is mirrored in Z, not
+            # X, so it converts as S_z.R.S_z (tools/space.py)
+            "matrix": {"brush_rows": [list(r) for r in rows],
                        "translation": list(trans)},
             "scale": [math.sqrt(sum(v * v for v in r)) for r in rows],
             "texture": texname(s["diffuse"]),
             "content": (LAVA if kind == "lava" else WATER) if kind else AIR,
             "triangles": n,
+            # Its collision record (node +0x28): 0 on the 15 empty brushes and
+            # on 135 visible ones that have vertices but no triangles.
+            "collision_triangles": len(bmesh[s["index"]]["tris"]) if bmesh.get(s["index"]) else 0,
+            # A visible brush with no collision triangles never blocks in NE:
+            # 134 of the 135 extra WorldBase brushes (all alpha-textured
+            # decoration) and one water-flow mover. The writer sets SE1's
+            # BPOF_PASSABLE on its polygons.
+            "passable": bool(n) and not (bmesh.get(s["index"]) or {}).get("tris"),
             "motion": (mover_motion(_decode(img, owner))
                        if owner and owner["cls"] == MOVER_CLASS else None),
             # level.py mesh writes these groups in WORLD space; the writer
@@ -676,15 +1019,19 @@ def describe(container, path):
             "geometry_space": "world",
         })
 
-    ls = [se1_light(l) for l in lights(img)]
+    raw = list(lights(img))
+    ls = [se1_light(l) for l in raw]
+    _drop_unbaked(raw, ls)
     _fold_sun_fills(ls)
+    _drop_unlit_suns(ls)
     fields = field_entities(container, ents)
     regions = region_description(container)
     props, effects = props_description(container, stem)
-    return {
+    return space.to_original({
         "level": stem,
         "geometry": "build/mesh/%s.obj" % stem,
-        "axes": "NE and SE1 are both y-up; positions are copied unscaled",
+        "axes": ("original space, y-up, unscaled: NE's world z and model-local x "
+                 "negated, rotations S_z.R.S_x (tools/space.py)"),
         "worldbase": {"sectors": world_sectors},
         "region_brush": regions["brush"],
         "haze_markers": regions["haze_markers"],
@@ -698,8 +1045,10 @@ def describe(container, path):
         "music": music_description(img, ents),
         "sounds": sound_description(ents),
         "messages": message_description(ents, stem),
+        "cameras": camera_description(ents),
+        "scripts": script_description(ents),
         "entities":"build/entities/%s.json" % stem,
-    }
+    })
 
 
 # --- subcommands ------------------------------------------------------------
@@ -750,7 +1099,7 @@ def _hull2d(ps):
 
 def cmd_render(args):
     """Top-down check of the description: liquid sectors tinted by content,
-    brush entities in purple, point lights as fall-off rings in their own
+    brush entities in purple, point and ambient lights as fall-off rings in their own
     colour (dark lights in magenta), directional lights as an arrow."""
     args.output.mkdir(parents=True, exist_ok=True)
     for path in args.files:
@@ -773,7 +1122,7 @@ def cmd_render(args):
         # Bound by what is actually drawn: some levels (Alevel11_3) carry
         # far-flung vertices that no display list uses, and bounding by the
         # whole position array squashes the level into a corner.
-        drawn = [q for tri in world_triangles(cont) for q in tri]
+        drawn = [space.world(q) for tri in world_triangles(cont) for q in tri]
         x0, x1 = band([p[0] for p in drawn])
         z0, z1 = band([p[2] for p in drawn])
         W = args.size
@@ -803,7 +1152,7 @@ def cmd_render(args):
             for xf, tl, rgb in layer:
                 for tri in tl:
                     if max(v[F_POS] for v in tri) < len(pts):
-                        _fill_tri(put, [px(apply_xform(xf, pts[v[F_POS]]))
+                        _fill_tri(put, [px(space.world(apply_xform(xf, pts[v[F_POS]])))
                                         for v in tri], rgb)
 
         draw(layers[0])
@@ -865,8 +1214,8 @@ def cmd_verify(args):
         tot["underwater env"] += sum(1 for x in rc if x["environment"] == UNDERWATER)
         tot["cells with haze"] += sum(1 for x in rc if x["haze"])
         tot["haze markers"] += len(d["haze_markers"])
-        if len(d["haze_markers"]) > 9:
-            problems.append("%s: more than 9 haze slots" % f.stem)
+        if len(d["haze_markers"]) > 4:
+            problems.append("%s: more than 4 haze slots" % f.stem)
         for x in rc:
             if len(x["vertices"]) < 4 or len(x["faces"]) < 4:
                 problems.append("%s: degenerate region cell" % f.stem)
@@ -874,6 +1223,10 @@ def cmd_verify(args):
         for b in d["brush_entities"]:
             tot["brush: " + b["class"]] += 1
             tot["invisible brushes"] += b["invisible"]
+            tot["brushes with collision triangles"] += bool(b["collision_triangles"])
+            tot["empty brushes"] += b["invisible"] and not b["collision_triangles"]
+            tot["passable brushes"] += b["passable"]
+            tot["passable WorldBase brushes"] += b["passable"] and b["class"] == "WorldBase"
             mo = b.get("motion")
             if b["class"] == "MovingBrush":
                 tot["movers with motion"] += mo is not None
@@ -893,12 +1246,28 @@ def cmd_verify(args):
                             else "mover sounds missing in game"] += 1
                 if any(m["position"] is None for m in ms):
                     problems.append("%s: marker without a position" % f.stem)
+                br, m0 = b["matrix"]["brush_rows"], ms[0]["rows"]
+                if m0 and all(abs(m0[i][j] - br[i][j] / (math.sqrt(sum(x * x for x in br[i])) or 1)) < 2e-3
+                              for i in range(3) for j in range(3)):
+                    tot["key 0 rotation == brush rotation"] += 1
                 if math.dist(ms[0]["position"], b["matrix"]["translation"]) > 1e-2:
                     tot["key 0 off the brush placement"] += 1
+        for x in d["scripts"]["entities"]:
+            tot["scripts: %s" % x["se1"]["class"]] += 1
+            tot["script links"] += len(x["links"])
+            tot["scripts"] += 1
+        for why, n in d["scripts"]["skipped"].items():
+            tot["scripts not written: %s" % why] += n
         tot["touch fields"] += len(d["touch_fields"])
         tot["touch targets resolved"] += sum(1 for t in d["touch_fields"] if t["target_resolves"])
         tot["touch targets set"] += sum(1 for t in d["touch_fields"] if t["target_resolves"] is not None)
+        tot["touch fields with a volume"] += sum(1 for t in d["touch_fields"] if t["volume"])
+        tot["touch volumes closed"] += sum(1 for t in d["touch_fields"]
+                                           if t["volume"] and t["volume"]["closed"])
         tot["bouncers"] += len(d["bouncers"])
+        tot["bouncers with a volume"] += sum(1 for b in d["bouncers"] if b["volume"])
+        tot["bouncer volumes closed"] += sum(1 for b in d["bouncers"]
+                                             if b["volume"] and b["volume"]["closed"])
         tot["music entities"] += len(d["music"])
         tot["music -> MusicHolder"] += sum(1 for m in d["music"] if m.get("se1", {}).get("class") == "MusicHolder")
         tot["music -> MusicChanger"] += sum(1 for m in d["music"] if m.get("se1", {}).get("class") == "MusicChanger")
@@ -928,6 +1297,33 @@ def cmd_verify(args):
                 problems.append("%s: MessageHolder %d text unresolved" % (f.stem, m["entity_id"]))
             if not all(Path(p).exists() for p in m["files"].values()):
                 problems.append("%s: message file missing (tools/text.py messages)" % f.stem)
+        for c in d["cameras"]:
+            tot["cameras"] += 1
+            tot["cameras: static" if c["static"] else "cameras: with a path"] += 1
+            ed = se1_rotation(*c["angles"])
+            tot["camera rotation == editor angles"] += max(
+                abs(c["rotation"][i][j] - ed[i][j]) for i in range(3) for j in range(3)) < 2e-3
+            tot["camera paths that stop at the end"] += bool(
+                c["markers"] and c["markers"][-1]["se1"]["Stop moving"])
+            for m in c["markers"]:
+                tot["camera markers"] += 1
+                if m["position"] is None:
+                    problems.append("%s: camera %d marker without a position"
+                                    % (f.stem, c["entity_id"]))
+                ed = se1_rotation(*m["angles"])
+                tot["marker rotation == editor angles"] += max(
+                    abs(m["rotation"][i][j] - ed[i][j]) for i in range(3) for j in range(3)) < 2e-3
+                if m["own_matrix"]:
+                    tot["markers with their own Mtx"] += 1
+                    tot["marker rotation == own Mtx"] += max(
+                        abs(m["rotation"][i][j] - m["placement_rot"][i][j])
+                        for i in range(3) for j in range(3)) < 2e-3
+                if m["trigger_resolves"] is not None:
+                    tot["marker triggers"] += 1
+                    tot["marker triggers resolved"] += m["trigger_resolves"]
+                    if not m["trigger_resolves"]:
+                        problems.append("%s: camera %d trigger %s unresolved"
+                                        % (f.stem, c["entity_id"], m["se1"]["Trigger"]))
         tot["props"] += len(d["props"])
         tot["multi-material props"] += sum(1 for x in d["props"] if x["materials"] > 1)
         for x in d["props"]:
@@ -946,6 +1342,9 @@ def cmd_verify(args):
         tot["liquid brushes"] += sum(1 for b in d["brush_entities"] if b["content"])
         tot["lights"] += len(d["lights"])
         tot["directional"] += sum(1 for l in d["lights"] if "direction" in l)
+        for l in d["lights"]:
+            if not l.get("skip"):
+                tot["created as %s" % l["props"]["Type"]] += 1
         tot["dark"] += sum(1 for l in d["lights"] if l["props"]["Dark light"])
         tot["clamped"] += sum(1 for l in d["lights"] if l["ne"]["clamped"])
         tot["force fields"] += len(d["force_fields"])
@@ -954,6 +1353,12 @@ def cmd_verify(args):
                                        if "folded into" in l.get("skip", ""))
         tot["no-reach skipped"] += sum(1 for l in d["lights"]
                                        if l.get("skip", "").startswith("fall-off"))
+        tot["second copies dropped"] += sum(1 for l in d["lights"]
+                                            if l.get("skip", "").startswith("second copy"))
+        tot["other unbaked dropped"] += sum(1 for l in d["lights"]
+                                            if l.get("skip", "").startswith("+0x3c"))
+        tot["unlit suns dropped"] += sum(1 for l in d["lights"]
+                                         if l.get("skip", "").startswith("horizontal"))
         tot["unpaired fills"] += sum(1 for l in d["lights"]
                                      if l["ne"].get("unpaired_fill"))
         tot["lights to create"] += sum(1 for l in d["lights"] if not l.get("skip"))
@@ -962,7 +1367,7 @@ def cmd_verify(args):
                 problems.append("%s: light colour out of range" % f.stem)
             if ("direction" not in l and not l.get("skip")
                     and l["props"]["Fall-off"] <= 0):
-                problems.append("%s: point light with no fall-off" % f.stem)
+                problems.append("%s: point or ambient light with no fall-off" % f.stem)
             if l["props"]["Dark light"] and "direction" in l:
                 problems.append("%s: dark directional (SE1 refuses)" % f.stem)
         # every referenced OBJ group must exist in the exported mesh
@@ -983,27 +1388,40 @@ def cmd_verify(args):
               "lava cells", "underwater env", "cells with haze",
               "haze markers", "brush entities",
               "brush: MovingBrush", "brush: DestroyableArchitecture",
-              "brush: WorldBase", "invisible brushes", "movers with motion",
+              "brush: WorldBase", "invisible brushes", "empty brushes",
+              "brushes with collision triangles", "passable brushes",
+              "passable WorldBase brushes", "movers with motion",
               "markers", "auto-start movers", "movers that never stop (loop)",
               "zero-time keyframes", "key 0 off the brush placement",
+              "key 0 rotation == brush rotation",
               "mover sounds resolved", "mover sounds missing in game",
               "touch fields",
-              "touch targets set", "touch targets resolved", "bouncers",
+              "touch targets set", "touch targets resolved",
+              "touch fields with a volume", "touch volumes closed", "bouncers",
+              "bouncers with a volume", "bouncer volumes closed",
               "music entities", "levels with music", "music -> MusicHolder",
               "music -> MusicChanger", "music hash not a track",
               "sound holders", "sound -> SoundHolder", "sound: sample resolved",
               "sound: sample missing in game", "sound: speech resolved",
               "sound: speech missing in game", "sound: silent", "sound: looping",
               "sound: corrected like the game", "messages", "messages resolved",
+              "cameras", "cameras: static", "cameras: with a path",
+              "camera rotation == editor angles", "marker rotation == editor angles",
+              "camera paths that stop at the end", "camera markers",
+              "markers with their own Mtx", "marker rotation == own Mtx",
+              "marker triggers", "marker triggers resolved",
               "props",
               "multi-material props", "props: ModelHolder2",
               "props: ModelHolder3", "props with damage states", "effects",
               "effects: smallflame", "effects: bigflame", "effects: Marker",
               "effects: unknown",
               "liquid brushes", "lights", "directional",
-              "dark", "clamped", "sun fills folded", "no-reach skipped",
-              "unpaired fills", "lights to create", "force fields",
-              "force fields emitted"):
+              "dark", "clamped", "sun fills folded", "no-reach skipped", "second copies dropped", "other unbaked dropped", "unlit suns dropped",
+              "unpaired fills", "lights to create", "created as LT_POINT",
+              "created as LT_AMBIENT", "created as LT_DIRECTIONAL", "force fields",
+              "force fields emitted", "scripts", "script links"):
+        print("  %-16s %s" % (k, format(tot[k], ",")))
+    for k in sorted(k for k in tot if k.startswith("scripts: ") or k.startswith("scripts not written")):
         print("  %-16s %s" % (k, format(tot[k], ",")))
     for p in problems[:20]:
         print("  PROBLEM " + p)

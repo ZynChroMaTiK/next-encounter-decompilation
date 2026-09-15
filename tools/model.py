@@ -69,6 +69,7 @@ from level import (PRIMS, _parse_prims, _to_triangles, _chain,   # noqa: E402
                    apply_xform, world_triangles, MAT_DIFFUSE)
 from entity import model_instances, _fill_tri                    # noqa: E402
 from gxtex import walk as texwalk, decode, write_png             # noqa: E402
+import space                                                     # noqa: E402
 
 MESH_LIST = 0x5C
 MESH_MATERIALS = 0x04
@@ -253,7 +254,8 @@ def _write_obj(fh, mtl_fh, meshes_with_xform, stem_label):
     for label, m, xf in meshes_with_xform:
         fh.write("o %s\n" % label)
         for p in m["pos"]:
-            x, y, z = apply_xform(xf, p) if xf else p
+            # original space (tools/space.py): world Z or model-local X mirrored
+            x, y, z = space.world(apply_xform(xf, p)) if xf else space.local(p)
             fh.write("v %.4f %.4f %.4f\n" % (x, y, z))
         for u, v in m["uv"]:
             fh.write("vt %.6f %.6f\n" % (u, 1.0 - v))
@@ -262,6 +264,7 @@ def _write_obj(fh, mtl_fh, meshes_with_xform, stem_label):
             materials[key] = mat["diffuse"]
             fh.write("usemtl %s\n" % key)
             for tri in mat["tris"]:
+                tri = space.face(tri)                   # mirrored: keep the facing
                 okp, oku = _valid(m, tri)
                 if not okp:
                     continue
@@ -377,7 +380,7 @@ def cmd_render(args):
                     if _valid(m, t)[0]]
             if not tris:
                 continue
-            P = m["pos"]
+            P = [space.local(p) for p in m["pos"]]
             xs = [P[v[0]][0] for t in tris for v in t]
             ys = [P[v[0]][1] for t in tris for v in t]
             sc = (S - 20) / max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)
@@ -396,7 +399,7 @@ def cmd_render(args):
         g = args.output / (path.stem + "_meshes.png")
         write_png(g, W, H, bytes(buf))
         # placed instances top-down
-        vs = [q for tri in world_triangles(cont) for q in tri]
+        vs = [space.world(q) for tri in world_triangles(cont) for q in tri]
         lo = [min(v[i] for v in vs) for i in range(3)]
         hi = [max(v[i] for v in vs) for i in range(3)]
         W2 = args.size
@@ -412,7 +415,7 @@ def cmd_render(args):
         def px(p):
             return int(10 + (p[0] - lo[0]) * s), int(10 + (p[2] - lo[2]) * s)
         for tri in world_triangles(cont):
-            _fill_tri(put2, [px(q) for q in tri], (52, 56, 66))
+            _fill_tri(put2, [px(space.world(q)) for q in tri], (52, 56, 66))
         bym = {m["node"]: m for m in meshes}
         placed = 0
         for inst in L.instances:
@@ -424,7 +427,8 @@ def cmd_render(args):
             for mat in m["materials"]:
                 for t in mat["tris"]:
                     if _valid(m, t)[0]:
-                        _fill_tri(put2, [px(apply_xform(xf, m["pos"][v[0]])) for v in t],
+                        _fill_tri(put2, [px(space.world(apply_xform(xf, m["pos"][v[0]])))
+                                         for v in t],
                                   (120, 210, 120))
         d = args.output / (path.stem + "_props.png")
         write_png(d, W2, H2, bytes(buf2))

@@ -5,8 +5,10 @@
 - `tools/sound.py extract` writes the effects bank: 540 samples, 14.5
   minutes, plus `build/sound/index.json`.
 - `tools/sound.py streams` writes `StreamData.dat`: 11 music tracks as 33
-  stereo layer WAVs, 375 speech lines (21.8 minutes) in three languages, and
-  `build/sound/streams.json`.
+  stereo layer WAVs at 44.1 kHz, 375 speech lines (21.8 minutes) in three
+  languages at 32 kHz, and `build/sound/streams.json`. Resampling the music
+  needs numpy (`python -m pip install numpy`); `--music-rate 32000` keeps
+  the stream's own rate without it, and `--music-only` skips the speech.
 
 ## The bank: `Sound/sfxbank1.spt` + `sfxbank1.spd`
 
@@ -176,8 +178,21 @@ struct CcSoundHolderProps {  // class 4100, 52 bytes
 ## For SE1
 
 SE1 plays WAV, so `build/sound/sfx_NNN.wav` (16-bit mono, 32 kHz) loads
-as-is. So do the music layers, which are 16-bit stereo:
-`build/sound/music/trackNN_layerK.wav` feed `MusicHolder`'s Music
+as-is. SE1 mixes at 44.1 kHz and brings any other rate to it by linear
+interpolation, so **the music layers are written at 44.1 kHz**
+(`tools/sound.py`, `resample`): a Kaiser-windowed sinc cut off at 15.5 kHz,
+flat to 14.5 kHz (1, 10 and 14.5 kHz tones within 0.01 dB), every image
+and alias at least 90 dB down, and each looped track padded with its own
+other end so its loop point stays seamless. At 32 kHz they had also played
+with a loud whistle on an x64 build, from a bug in the fork's stereo mixer
+that a 32 kHz sound at a 44.1 kHz mixer triggers constantly; that is patched
+too (`pc/README.md`, "Patches to the fork"). The game plays the streams as
+`tools/sound.py` decodes them: its voice setup (`0x80110f10`) gives each
+voice its own row's coefficients, the first header as initial predictor,
+zero history, no sample-rate conversion, and a two-chunk looping ARAM buffer
+the refill (`0x80111ce8`, `0x80111ea8`) fills from six-chunk reads, chunk k
+to voice k. The music layers,
+`build/sound/music/trackNN_layerK.wav` (16-bit stereo), feed `MusicHolder`'s Music
 Light/Medium/Heavy (`docs/world-conversion.md`, "Music"). Speech lines,
 `build/sound/speech/langL_NNN.wav`, are mono. NE's SoundHolder is SE1's
 `SoundHolder` field for field (Sound, Fall-off, Hot-spot, Volume, Auto

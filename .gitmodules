@@ -1,6 +1,9 @@
 [submodule "pc/engine"]
 	path = pc/engine
 	url = https://github.com/tx00100xt/SeriousSamClassic-VK.git
+	# Local builds (pc/build-windows.ps1) leave generated sources and Release/
+	# folders untracked in the fork; its .gitignore patterns miss the SamTSE/ prefix.
+	ignore = untracked
 [submodule "ref/serious-engine"]
 	path = ref/serious-engine
 	url = https://github.com/Croteam-official/Serious-Engine.git

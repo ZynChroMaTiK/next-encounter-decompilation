@@ -83,6 +83,7 @@ from level import _parse_prims, _to_triangles, PRIMS            # noqa: E402
 from entity import _fill_tri                                     # noqa: E402
 from gxtex import walk as texwalk, decode, write_png             # noqa: E402
 from model import _array, _write_obj                             # noqa: E402
+import space                                                     # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 MAGIC = (1, 0x64)
@@ -545,7 +546,7 @@ def cmd_render(args):
                     i = (y * W + x) * 4
                     buf[i:i + 3] = bytes(rgb)
             g = M.geometry(m)
-            P = g["pos"]
+            P = [space.local(p) for p in g["pos"]]
             tris = [t for mat in g["materials"] for t in mat["tris"]]
             if not tris:
                 continue
@@ -588,6 +589,7 @@ def _gallery(dest, cells, S=200, cols=6):
                 buf[i:i + 3] = bytes(rgb)
         if not T:
             continue
+        V = [space.local(p) for p in V]                # original space
         xs = [V[v][0] for t in T for v in t]
         ys = [V[v][1] for t in T for v in t]
         sc = (S - 20) / max(max(xs) - min(xs), max(ys) - min(ys), 1e-6)

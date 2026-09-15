@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  EntitiesNE: Next Encounter's own entity classes, the creatures TSE does not
+  have (docs/enemies.md). Built like the fork's EntitiesMP: each .es goes
+  through Ecc, and the DLL derives from EntitiesMP's classes. It is written to
+  pc/engine/SamTSE/Bin as EntitiesNEMP.dll: a class file (.ecl) naming
+  "Bin\EntitiesNE.dll" gets the mod extension "MP" inserted when it loads.
+  Build the engine and EntitiesMP first: pc\build-windows.ps1 -Entities.
+-->
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{3C7A2E51-8D4B-4F2A-A1C6-7E9B0D5F2A61}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>EntitiesNE</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseOfMfc>Dynamic</UseOfMfc>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <GameRoot>$(MSBuildThisFileDirectory)..\engine\SamTSE\</GameRoot>
+    <EngineSources>$(GameRoot)Sources\</EngineSources>
+    <OutDir>$(GameRoot)Bin\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\..\build\entities\$(Configuration)\</IntDir>
+    <TargetName>EntitiesNEMP</TargetName>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <WarningLevel>Level3</WarningLevel>
+      <PreprocessorDefinitions>SE1_VULKAN;WIN32;NDEBUG;_WINDOWS;_WINDLL;_USRDLL;DIRECT3D_VERSION=0x0800;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory);$(EngineSources);$(GameRoot);$(VULKAN_SDK)\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <DisableSpecificWarnings>4996;4333</DisableSpecificWarnings>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>EntitiesNE/StdH/StdH.h</PrecompiledHeaderFile>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(EngineSources)Engine\Release;$(EngineSources)EntitiesMP\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>Engine.lib;EntitiesMP.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <PostBuildEvent>
+      <Command>xcopy /y /q /i "$(MSBuildThisFileDirectory)Classes\*.ecl" "$(GameRoot)Classes"</Command>
+      <Message>Class files to the game root's Classes</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="EntitiesNE\StdH\StdH.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="EntitiesNE\GCEnemyGenericDumDumLarge.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="EntitiesNE\GCEnemyGenericDumDumLarge.es">
+      <Command>cd /d "$(MSBuildThisFileDirectory)" &amp;&amp; "$(GameRoot)Bin\Ecc.exe" EntitiesNE/%(Filename).es</Command>
+      <Message>Ecc EntitiesNE/%(Filename).es</Message>
+      <Outputs>$(MSBuildThisFileDirectory)EntitiesNE\%(Filename).cpp;$(MSBuildThisFileDirectory)EntitiesNE\%(Filename).h;$(MSBuildThisFileDirectory)EntitiesNE\%(Filename)_tables.h</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -71,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ssg import Container                                    # noqa: E402
 from level import positions, world_triangles                 # noqa: E402
 from gxtex import write_png                                  # noqa: E402
+import space                                                     # noqa: E402
 
 ENTITY_LIST = 0x40
 E_NEXT, E_XFORM, E_NAME, E_CLASS = 0x00, 0x04, 0x08, 0x0C
@@ -111,7 +112,7 @@ CLASSES = {
     4200: ("Prop",             "world"),
     4210: ("ModelDestruction", "world"),
     4220: ("Bouncer",          "world"),
-    4230: ("Unknown4230",      "logic"),
+    4230: ("RollingStone",     "world"),
     4240: ("DestroyableArch",  "world"),
     4260: ("Arrow",            "pickup"),
     4270: ("LockDown",         "pickup"),
@@ -158,6 +159,18 @@ ITEM_TYPES_OBSERVED = {
     60: "DMWeapon4?", 61: "DMWeapon5?", 67: "DMAmmo1?", 68: "DMAmmo2?",
     69: "DMAmmo3?", 70: "DMAmmo4?", 71: "DMAmmo5?",
 }
+# ParticlesHolder type (+0x02) -> SE1 ParticlesHolderType, by the designers'
+# names for each value (LockTwinkle, Particles fountain, PHold_Teleport,
+# VentSmoke, Steam Particle, particle holder lightning). NE numbers them its
+# own way; 3 is not used on the disc. The init (0x8008133c) maps each to an
+# effect flag.
+PARTICLE_TYPES = {0: "Lock Twinkle", 1: "Waterfall Spray1", 2: "Teleport",
+                  4: "Smoke", 5: "Steam", 6: "Lightning"}
+# ModelDestruction debris type (+0x04) is SE1's ModelDebrisType unchanged:
+# urns 0, statues 1, barrels and furniture 2, trees 3, alien plants 4,
+# pearl globes 5.
+DEBRIS_TYPES = ("Pottery", "Stone", "Wood", "Tree", "Vegetation", "Ice", "Honeycomb")
+
 PICKUP_CLASSES = {2100, 2200, 3100, 3200, 3201, 3210, 3215, 3220,
                   4260, 4270, 4320}
 
@@ -274,6 +287,7 @@ LINKS = {
     4070: {"switch": 0x24},                        # Mover -> Switch
     4200: {"destruction": 0x08},                   # Prop -> ModelDestruction
     4100: {"parent": 0x08},                        # SoundHolder -> its parent
+    4190: {"link_04": 0x04, "link_0c": 0x0C},      # Vehicle -> Trigger / WorldLink
 }
 for _c in PICKUP_CLASSES - {4270, 4320}:          # LockDown and Flag are not
     LINKS.setdefault(_c, {})["target"] = 0x08     # pickups; fired on pickup
@@ -298,7 +312,9 @@ def _decode(img, e):
             if v:
                 links[name] = v
 
-    if cls in PICKUP_CLASSES and cls != 4260:
+    # Arrow and LockDown sit in the pickup list for their links, but their
+    # +0x00 is Active (their inits test it), not an item index.
+    if cls in PICKUP_CLASSES and cls not in (4260, 4270):
         idx = u32(img, p)
         if idx == 0xFFFFFFFF:
             out.update(item=None, item_name=None)
@@ -336,6 +352,95 @@ def _decode(img, e):
                    height=f32(img, p + 8), type=u32(img, p + 0x0C))
     elif cls == 4110 and size >= 8:               # -> SE1 Damager
         out.update(amount=f32(img, p))
+    elif cls == 4120 and size >= 0x30:            # -> SE1 Camera + CameraMarkers
+        # SE1's Camera -> CameraMarker chain, packed into the camera's props.
+        # Header {f32 fov, f32 time, marker* first, 0, 0, f32 h, p, b, 0 x4}:
+        # a 48-byte camera has no markers and holds its own view for `time`.
+        # Each marker, as the update (0x80078a38) and its loader (0x8007992c)
+        # read it:
+        #   +0x00 f32 fov         +0x04 skip to next    +0x08 stop moving
+        #   +0x0c trigger id      +0x10 f32 delta time  +0x14 Mtx* placement
+        #   +0x18 next marker*    +0x1c f32 (0..0.7)    +0x20 f32 tension
+        #   +0x24, +0x28 f32 bias and continuity (0 on the whole disc)
+        #   +0x2c f32 (-1 on the whole disc)
+        #   +0x30 f32 h, p, b     SE1 editor angles
+        #   +0x48 Mtx             own placement, 0x78-byte records only
+        # The game takes the position from the placement's translation and
+        # the orientation from the angles, never the Mtx rotation. The spline
+        # is Kochanek-Bartels over a 4-marker window.
+        markers, first = [], u32(img, p + 8)
+        rec = first
+        while rec and rec + 0x48 <= len(img) and len(markers) < 64:
+            xf = u32(img, rec + 0x14)
+            rot, pos = transform(img, xf) if 0 < xf and xf + 48 <= len(img) else (None, None)
+            trig = _opt(u32(img, rec + 0x0C))
+            markers.append({
+                "pos": pos, "angles": [f32(img, rec + 0x30 + 4 * k) for k in range(3)],
+                "fov": f32(img, rec), "delta_time": f32(img, rec + 0x10),
+                "skip_to_next": bool(u32(img, rec + 4)),
+                "stop_moving": bool(u32(img, rec + 8)), "trigger": trig,
+                "tension": f32(img, rec + 0x20),
+                "bias_continuity": [f32(img, rec + 0x24), f32(img, rec + 0x28)],
+                "unknown_1c": f32(img, rec + 0x1C), "unknown_2c": f32(img, rec + 0x2C),
+                "own_matrix": xf == rec + 0x48,
+                "placement_rot": rot})
+            if trig:
+                links["marker%02d_trigger" % len(markers)] = trig
+            rec = u32(img, rec + 0x18)
+            if rec == first:
+                break
+        out.update(fov=f32(img, p), time=f32(img, p + 4),
+                   angles=[f32(img, p + 0x14 + 4 * k) for k in range(3)],
+                   markers=markers, loops=bool(markers) and rec == first)
+    elif cls == 4330 and size >= 0x14:            # -> GCLevelPar
+        # The ParWatcher init (0x80081750) reads the five in GCLevelPar's order.
+        out.update(par_time=f32(img, p), par_kills=f32(img, p + 4),
+                   bronze_score=f32(img, p + 8), silver_score=f32(img, p + 0x0C),
+                   gold_score=f32(img, p + 0x10))
+    elif cls == 4160 and size >= 0x0C:            # -> SE1 WorldLink
+        # Its init logs "WorldName %s" (+0x04) and "EndGameFlag %d" (u16 +0x08).
+        # +0x00 is 2 on the whole disc: SE1's WorldLinkType "Relative".
+        w = u32(img, p + 4)
+        out.update(type=u32(img, p), world=cstr(img, w) if 0 < w < len(img) else None,
+                   end_game=bool(struct.unpack_from(">H", img, p + 8)[0]))
+    elif cls == 4340 and size >= 4:               # -> GCFMVPlayer
+        w = u32(img, p)
+        out.update(fmv=cstr(img, w) if 0 < w < len(img) else None)
+    elif cls == 4280 and size >= 8:               # -> GCWarpPlayers
+        # +0x00 Active (its init tests it); u16 +0x04 the PlayerStart to warp to.
+        out.update(active=bool(u32(img, p)))
+        t = struct.unpack_from(">H", img, p + 4)[0]
+        if t != 0xFFFF:
+            links["target"] = t
+    elif cls == 4270 and size >= 8:               # -> GCLockDown
+        out.update(active=bool(u32(img, p)), scale=f32(img, p + 4))
+    elif cls == 4260 and size >= 0x14:            # -> GCArrow
+        # The init picks "yellowarrow" / "greenarrow" from +0x10 (1 / 2).
+        out.update(active=bool(u32(img, p)), inherit_pos=bool(u32(img, p + 4)),
+                   do_not_scale=bool(u32(img, p + 0x0C)), type=u32(img, p + 0x10))
+    elif cls == 4310 and size >= 0x28:            # -> SE1 ParticlesHolder
+        # s16 +0x00 Active and +0x02 type, as the init (0x8008133c) reads them,
+        # then GCN's Count, StretchAll, StretchX/Y/Z, Size, Param1-3.
+        act, t, n = struct.unpack_from(">HHH", img, p)
+        out.update(active=bool(act), type=t, type_name=PARTICLE_TYPES.get(t), count=n,
+                   stretch_all=f32(img, p + 8),
+                   stretch=[f32(img, p + 0x0C + 4 * k) for k in range(3)],
+                   size=f32(img, p + 0x18),
+                   params=[f32(img, p + 0x1C + 4 * k) for k in range(3)])
+    elif cls == 4210 and size >= 0x18:            # -> SE1 ModelDestruction
+        # The init (0x8007d7bc) loads +0x04..+0x10 and the s16 at +0x14.
+        d = u32(img, p + 4)
+        out.update(debris_type=d,
+                   debris_name=DEBRIS_TYPES[d] if d < len(DEBRIS_TYPES) else None,
+                   debris_count=u32(img, p + 8), debris_size=f32(img, p + 0x0C),
+                   health=f32(img, p + 0x10))
+        t = struct.unpack_from(">h", img, p + 0x14)[0]
+        if t != -1:
+            links["trigger_on_destruction"] = t & 0xFFFF
+    elif cls == 4190 and size >= 0x10:            # -> GCVehicle
+        # +0x00 NE's own type (Jeeps 2, submarines 3, the Combine 0), u16 +0x08
+        # active (the init tests it); +0x04 and +0x0c are links.
+        out.update(type=u32(img, p), active=bool(struct.unpack_from(">H", img, p + 8)[0]))
     elif cls == 4170 and size >= 0x14:            # -> SE1 TouchField
         out.update(volume_index=u32(img, p + 0x10))
     elif cls == 4220 and size >= 0x14:            # -> SE1 Bouncer (likely)
@@ -660,7 +765,9 @@ def cmd_json(args):
         for m in ms:
             m.pop("rot", None)
         dest = args.output / (path.stem + ".json")
-        dest.write_text(json.dumps({"level": path.stem, "count": len(es),
+        dest.write_text(json.dumps({"level": path.stem,
+                                    "space": "NE, raw (tools/space.py converts)",
+                                    "count": len(es),
                                     "entities": es, "models": ms}, indent=1))
         print("%s: %s entities, %s placed models -> %s"
               % (path.name, format(len(es), ","), format(len(ms), ","), dest))
@@ -712,7 +819,7 @@ def cmd_map(args):
     for path in args.files:
         cont = Container(path)
         img = cont.image
-        pts = positions(img)
+        pts = [space.world(p) for p in positions(img)]
         if not pts:
             print("%s: no position array" % path)
             continue
@@ -737,8 +844,9 @@ def cmd_map(args):
                 i = (z * W + x) * 4
                 buf[i:i + 3] = bytes(rgb)
 
-        def to_px(p):
-            return int(10 + (p[0] - x0) * s), int(10 + (p[2] - z0) * s)
+        def to_px(p):                                  # NE point -> original space
+            q = space.world(p)
+            return int(10 + (q[0] - x0) * s), int(10 + (q[2] - z0) * s)
 
         # Geometry as filled triangles, shaded by height, so the entity dots
         # can be judged against actual floors and walls rather than a haze of

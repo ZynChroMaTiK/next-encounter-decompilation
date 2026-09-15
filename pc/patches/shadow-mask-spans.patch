@@ -1,0 +1,39 @@
+diff --git a/SamTSE/Sources/Engine/Rendering/RenCache.cpp b/SamTSE/Sources/Engine/Rendering/RenCache.cpp
+index 3f45858..b430955 100644
+--- a/SamTSE/Sources/Engine/Rendering/RenCache.cpp
++++ b/SamTSE/Sources/Engine/Rendering/RenCache.cpp
+@@ -877,8 +877,13 @@ void CRenderer::AddSpansToScene(void)
+     return;
+   }
+ 
++  // a scan line outside the mask has nowhere to go
++  if( re_iCurrentScan<0 || re_iCurrentScan>=re_slShadowHeight) {
++    return;
++  }
++
+   _pfRenderProfile.StartTimer(CRenderProfile::PTI_ADDSPANSTOSCENE);
+-  UBYTE *pubShadow = re_pubShadow+re_slShadowWidth*re_iCurrentScan;
++  UBYTE *pubRow = re_pubShadow+re_slShadowWidth*re_iCurrentScan;
+ #ifndef NDEBUG
+   INDEX ctPixels = 0;
+ #endif
+@@ -886,12 +891,17 @@ void CRenderer::AddSpansToScene(void)
+   for( INDEX iSpan=0; iSpan<ctSpans; iSpan++)
+   { // get span start and stop I from edges
+     const CSpan &spSpan = re_aspSpans[iSpan];
+-    PIX pixI0 = PIXCoord( spSpan.sp_psedEdge0->sed_xI);
+-    PIX pixI1 = PIXCoord( spSpan.sp_psedEdge1->sed_xI);
++    // Clamped to the mask and written where they start. Written one after
++    // another from the start of the row, spans whose edges land outside a
++    // small mask ran past its end, corrupting the heap (an 8x8 mask on a
++    // converted Next Encounter level: 83 bytes past its safety wall).
++    PIX pixI0 = Clamp( PIXCoord( spSpan.sp_psedEdge0->sed_xI), (PIX)0, (PIX)re_slShadowWidth);
++    PIX pixI1 = Clamp( PIXCoord( spSpan.sp_psedEdge1->sed_xI), (PIX)0, (PIX)re_slShadowWidth);
+     // get its length
+     PIX pixLen = pixI1-pixI0;
+     // skip this span if zero pixels long
+     if( pixLen<=0) continue;
++    UBYTE *pubShadow = pubRow+pixI0;
+ 
+     // if the span's polygon is background and of proper illumination
+     if ((spSpan.sp_pspoPolygon->spo_spoScenePolygon.spo_ulFlags & SPOF_BACKLIGHT)

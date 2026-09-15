@@ -1,0 +1,5 @@
+# Ecc output: generated from the .es beside it on every build
+EntitiesNE/*.cpp
+EntitiesNE/*.h
+!EntitiesNE/StdH/StdH.cpp
+!EntitiesNE/StdH/StdH.h

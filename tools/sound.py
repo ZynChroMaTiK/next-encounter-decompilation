@@ -60,6 +60,9 @@ MUSIC_VOICES = 6        # a music hash starts rows i..i+5; even voice left, odd 
 STREAM_CHUNK = 0x2380
 SPEECH_BLOCK = 125      # rows per language: FUN_80111600 adds language * 0x7d
 STREAM_RATE = 32000     # not stored per row; the SFX bank's rate (see docs)
+# Music is written at SE1's mixer rate (snd_iFormat 3, 44.1 kHz), so the
+# engine plays it sample for sample instead of interpolating it linearly.
+MUSIC_RATE = 44100
 
 
 def load_bank(spt=SPT):
@@ -186,6 +189,50 @@ def decode_voice(track, k, data, nchunks=None):
                    "start": 2, "end": len(buf) * 2 - 1}, buf)
 
 
+def resample(samples, src, dst, looped=True, atten=90.0):
+    """int16 samples at `src` Hz -> int16 numpy array at `dst` Hz.
+
+    Band-limited polyphase interpolation: a Kaiser-windowed sinc cut off just
+    under the lower Nyquist frequency, `atten` dB down from there on, one
+    weight row per output phase, each row normalised to unity gain. A looped
+    sound is padded with its own other end so the loop point stays seamless.
+    Needs numpy."""
+    import math
+    try:
+        import numpy as np
+    except ImportError:
+        raise SystemExit("resampling needs numpy: python -m pip install numpy")
+    g = math.gcd(src, dst)
+    up, down = dst // g, src // g
+    x = np.asarray(samples, dtype=np.float64)
+    if up == down:
+        return x.astype(np.int16)
+    nyq = min(src, dst) / 2
+    stop, passband = nyq, 0.94 * nyq               # 15.04-16 kHz for 32 -> 44.1
+    fc = (stop + passband) / 2
+    beta = 0.1102 * (atten - 8.7)
+    taps = (atten - 7.95) * src / (2.285 * 2 * math.pi * (stop - passband))
+    K = int(math.ceil(taps / 2)) * 2               # input samples under the window
+    offs = np.arange(-K // 2 + 1, K // 2 + 1)      # tap position relative to floor(u)
+    d = (np.arange(up) / up)[:, None] - offs[None, :]
+    r = d / (K / 2)
+    win = np.i0(beta * np.sqrt(np.clip(1 - r * r, 0, None))) / np.i0(beta)
+    h = (2 * fc / src) * np.sinc(2 * fc / src * d) * win
+    h /= h.sum(axis=1, keepdims=True)
+    if looped:
+        xp = np.concatenate([x[-K:], x, x[:K]])
+    else:
+        xp = np.pad(x, (K, K))
+    nout = len(x) * up // down
+    out = np.empty(nout)
+    block = 1 << 16
+    for a in range(0, nout, block):
+        pos = np.arange(a, min(a + block, nout)) * down
+        idx = (pos // up)[:, None] + offs[None, :] + K
+        out[a:a + len(pos)] = np.einsum("ij,ij->i", xp[idx], h[pos % up])
+    return np.clip(np.rint(out), -32768, 32767).astype(np.int16)
+
+
 def _corr(a, b):
     n = min(len(a), len(b))
     if n < 2:
@@ -270,18 +317,30 @@ def cmd_streams(args):
     out = args.output
     (out / "music").mkdir(parents=True, exist_ok=True)
     (out / "speech").mkdir(parents=True, exist_ok=True)
-    index = {"rate": STREAM_RATE, "music": [], "speech": []}
+    rate = args.music_rate
+    index = {"rate": STREAM_RATE, "music_rate": rate, "music": [], "speech": []}
     for t, tr in enumerate(tracks):
         layers = []
         for k in range(0, len(tr) - 1, 2):
             name = "music/track%02d_layer%d.wav" % (t, k // 2)
-            write_wav(out / name, decode_voice(tr, k, data), STREAM_RATE,
-                      right=decode_voice(tr, k + 1, data))
+            left, right = decode_voice(tr, k, data), decode_voice(tr, k + 1, data)
+            if rate != STREAM_RATE:
+                left = array("h", resample(left, STREAM_RATE, rate).tobytes())
+                right = array("h", resample(right, STREAM_RATE, rate).tobytes())
+            write_wav(out / name, left, rate, right=right)
             layers.append(name)
         index["music"].append({"track": t, "hash": "%08x" % tr[0]["hash"],
                                "rows": [r["index"] for r in tr], "layers": layers,
                                "seconds": round(tr[0]["size"] // 8 * 14 / STREAM_RATE, 2)})
-        print("track %2d: %d layers, %.1f s" % (t, len(layers), index["music"][-1]["seconds"]))
+        print("track %2d: %d layers, %.1f s at %d Hz"
+              % (t, len(layers), index["music"][-1]["seconds"], rate))
+    if args.music_only:
+        old = out / "streams.json"
+        if old.exists():                 # keep the speech lines written before
+            index["speech"] = json.loads(old.read_text()).get("speech", [])
+        old.write_text(json.dumps(index, indent=1))
+        print("%d music tracks -> %s (speech not written)" % (len(tracks), out))
+        return 0
     for r, lang, j in lines:
         name = "speech/lang%d_%03d.wav" % (lang, j)
         s = decode(r, data)
@@ -332,6 +391,34 @@ def verify_streams():
           % (" ".join("%.2f" % c for c in best), good, len(best)))
     if good < len(best) - 1:
         problems.append("de-interleaved stereo pairs do not correlate")
+    return problems
+
+
+def verify_resample():
+    """Tones through resample(STREAM_RATE -> MUSIC_RATE): passband gain and the
+    worst image or alias left in the output."""
+    try:
+        import numpy as np
+    except ImportError:
+        print("  resampler            not checked (needs numpy)")
+        return []
+    problems, rows = [], []
+    for f in (1000, 10000, 14500):
+        t = np.arange(STREAM_RATE * 2) / STREAM_RATE
+        y = resample(np.rint(20000 * np.sin(2 * np.pi * f * t)).astype(np.int16),
+                     STREAM_RATE, MUSIC_RATE, looped=False).astype(float)
+        seg = y[8192:8192 + 65536]
+        spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+        freq = np.fft.rfftfreq(len(seg), 1 / MUSIC_RATE)
+        tt = (np.arange(len(seg)) + 8192) / MUSIC_RATE
+        fit = np.linalg.lstsq(np.vstack([np.sin(2 * np.pi * f * tt), np.cos(2 * np.pi * f * tt)]).T,
+                              seg, rcond=None)[0]
+        gain = 20 * np.log10(np.hypot(*fit) / 20000)
+        spur = 20 * np.log10(spec[np.abs(freq - f) > 300].max() / spec.max())
+        rows.append("%d Hz %+.2f dB, spurs %.0f dB" % (f, gain, spur))
+        if abs(gain) > 0.05 or spur > -80:
+            problems.append("resampler: %d Hz tone gain %.2f dB, spur %.0f dB" % (f, gain, spur))
+    print("  resampler %d -> %d  %s" % (STREAM_RATE, MUSIC_RATE, "; ".join(rows)))
     return problems
 
 
@@ -388,6 +475,7 @@ def cmd_verify(args):
     print("  hash rows            %d, %d sample refs, %d distinct samples used"
           % (len(table), len(refs), len(set(refs))))
     problems += verify_streams()
+    problems += verify_resample()
     for p in problems[:20]:
         print("  PROBLEM " + p)
     if loop_ok != loop_tested or swap_ok:
@@ -408,6 +496,10 @@ def main():
     p.set_defaults(func=cmd_extract)
     p = sub.add_parser("streams", help="StreamData.dat: music as stereo WAVs, speech as mono")
     p.add_argument("-o", "--output", type=Path, default=Path("build/sound"))
+    p.add_argument("--music-rate", type=int, default=MUSIC_RATE,
+                   help="music WAV rate; %d keeps the stream's own (default %d, needs numpy)"
+                        % (STREAM_RATE, MUSIC_RATE))
+    p.add_argument("--music-only", action="store_true", help="skip the speech lines")
     p.set_defaults(func=cmd_streams)
     p = sub.add_parser("verify", help="decode everything and check it is audio")
     p.set_defaults(func=cmd_verify)

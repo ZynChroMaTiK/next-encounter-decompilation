@@ -12,6 +12,10 @@ orig/*
 # models, sounds, text, worlds, renders. All derived from the game's assets.
 build/
 
+# Developer material from NE's production (SE1 1.04 tools, GC entity DLLs,
+# source worlds and models). Proprietary; reference only, never commit.
+dev/
+
 # Ghidra project: the database embeds main.dol's bytes and disassembly.
 ghidra/*.gpr
 ghidra/*.rep/
@@ -41,6 +45,55 @@ ghidra/*.lock~
 StreamData.dat
 # SE1 retail archives (needed to run stock SE1; not ours to ship).
 *.gro
+
+# Converted / generated media. Whatever tools/ or SE1's converters make from
+# the game's assets is still the game's: models, textures, skeletons and
+# animations, audio, fonts, renders. SE1 worlds (*.wld) are deliberately NOT
+# listed here.
+*.mdl
+*.tex
+*.tga
+*.bmp
+*.png
+*.jpg
+*.jpeg
+*.dds
+*.obj
+*.mtl
+*.ska
+*.bm
+*.an
+*.smc
+*.fnt
+*.wav
+*.ogg
+*.mp3
+*.aif
+*.aiff
+*.dsp
+*.adp
+# Maya / Climax model sources from dev/
+*.clm
+*.ma
+*.mb
+
+# ---------------------------------------------------------------------------
+# MSVC build output (pc/entities, pc/wldwriter)
+# ---------------------------------------------------------------------------
+.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.iobj
+*.ipdb
+*.tlog
+*.vcxproj.user
 
 # ---------------------------------------------------------------------------
 # Third-party tools and local environments — fetch them per docs/toolchain.md.

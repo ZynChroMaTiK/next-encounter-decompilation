@@ -18,7 +18,7 @@ pos=<..> dir=<..> as=%0.2f ae=%0.2f`:
 
     struct CcLight {
         CcLight* next;      // +0x00
-        u32      type;      // +0x04  1 static, 2 runtime point, 3 directional
+        u32      type;      // +0x04  1 ambient, 2 point, 3 directional
         float    col[3];    // +0x08  x255 and clamped at runtime; all-negative
                             //        = subtractive "dark" light
         float    pos[3];    // +0x14
@@ -32,7 +32,8 @@ pos=<..> dir=<..> as=%0.2f ae=%0.2f`:
 
 Only type 2 lights are instantiated by the level light setup (0x801386cc);
 type 3 goes through the directional path (0x8013f0ec); type 1 is never
-created there.
+created there. Type 1 is SE1's ambient light, no shadows and no angle term:
+baked that way the lightmap matches (docs/world-conversion.md, "Lights").
 
 **Materials** at `image + 0x08` — the CcMaterial list, per CcMaterial_Setup at
 0x8012e37c. Nodes are variable-length and *contain* their display-list
@@ -65,6 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ssg import Container                            # noqa: E402
 from gxtex import write_png, walk as _texwalk, decode as _decode  # noqa: E402
+import space                                                     # noqa: E402
 
 ARRAY_TABLE = 0xB4
 ARRAY_COUNT = 13
@@ -72,7 +74,32 @@ LIGHT_LIST = 0x34
 MATERIAL_LIST = 0x08
 MAT_DIFFUSE = 0x10          # CcTexture*, per CcMaterial_Setup
 MAT_SECOND = 0x18
+MAT_LAYERS = 0x1C           # first texture layer record, per the world material setup
 _MAT_NAME = re.compile(rb"Mat \d+ \([^\)]*\)[^\x00]*")
+_MAT_LABEL = re.compile(rb"Mat \d+ \((-?\d+),(-?\d+),(-?\d+)\) (-?\d+) (-?\d+)")
+
+# Texture layers 1 and 2 (docs/image-format.md, "Texture layers"). The label
+# "Mat 5 (11,7,1) 2049 -1" keeps the designers' Serious Editor settings: three
+# texture ids, then layer 1's and layer 2's settings, -1 where the layer is
+# unused, each blend index | SE1 texture flags << 9 (2049: blend 1 "Shade",
+# flags 4 BPTF_DISCARDABLE). The node holds a linked list of 0x18-byte records
+# {next, CcTexture*, mode, word, animation*, 0}, one per layer NE draws, in
+# layer order; the n-th record's UVs are TEX(n+1). NE drops the layers whose
+# blend it cannot draw (0 Opaque, 6 Add pulsating).
+LAYER_TEXTURE, LAYER_MODE, LAYER_WORD, LAYER_ANIM = 0x04, 0x08, 0x0C, 0x10
+NE_BLENDS = (1, 2, 3, 99)           # the blend indices that keep a record
+LAYER_AFTERSHADOW = 0x100000        # the record's copy of BPTF_AFTERSHADOW
+# Clamping, per axis, as NE draws it: the world material setup passes byte
+# 0x0f of a layer record (and 0x33 of the material, for the diffuse texture)
+# to the U wrap and byte 0x0e (0x32) to the V wrap, 1 clamping. A grass fringe
+# (Clevel5_4_164, 128x8, transparent rows on top, green at the bottom) is
+# clamped in V: one fringe along a path's edge and solid grass beyond, where
+# repeating it draws stripes. The label's clamp bits are not what NE draws.
+MAT_CLAMP_U, MAT_CLAMP_V = 0x33, 0x32
+CLAMP_U, CLAMP_V = 1, 2             # BPTF_CLAMPU, BPTF_CLAMPV
+# An unlabelled node's record mode -> SE1 blend and flags, as its labelled
+# twins have them: 4 is Blend with flags 6, 5 and 6 Add with the caustic bits.
+MODE_SE1 = {1: (1, 4), 2: (2, 4), 3: (3, 4), 4: (2, 6), 5: (3, 4), 6: (3, 4), 7: (2, 4)}
 
 # Movable geometry lives in its own list at image+0x48: doors, gates and moving
 # brushes. Each node is material-like (its own CcTexture at +0x58) and owns its
@@ -87,6 +114,7 @@ _MAT_NAME = re.compile(rb"Mat \d+ \([^\)]*\)[^\x00]*")
 SECTOR_LIST = 0x48
 SEC_XFORM = 0x08
 SEC_DIFFUSE = 0x58
+SEC_LAYERS = 0x64
 
 # Render geometry is GX display lists: [opcode][u16 vertexCount][vertex data],
 # each vertex a tuple of u16 indices into the CcArray table. A descriptor is a
@@ -187,6 +215,7 @@ def lights(img):
             "range": att_end,                 # kept for older callers
             "index": u32(img, node + 0x34),
             "flags": u32(img, node + 0x38),
+            "kind": u32(img, node + 0x3C),   # 0 baked into the level's lightmap
         }
         node = u32(img, node)
 
@@ -201,6 +230,63 @@ def _chain(img, head, minsize=0x50):
         nxt = u32(img, node)
         out.append((node, nxt))
         node = nxt
+    return out
+
+
+def layers(img, head, tex, name):
+    """A material or brush node's texture layers 1 and 2, as
+    [{"slot", "texture", "field", "blend", "flags", "caustic", "mode",
+    "setting", "position"}]: "slot" the SE1 layer it goes on (`_place`),
+    "field" the vertex field of its UVs, "blend" and "flags" SE1's (flags only
+    the five SE1 defines), "caustic" the two bits above them that NE animates
+    (0x20, 0x60), "clamp" the axes NE clamps (CLAMP_U, CLAMP_V), "setting"
+    the label's raw value or None, "position" 1 or 2, where the label (or,
+    without one, the record list) has it."""
+    recs, r, seen = [], u32(img, head), set()
+    while r and r + 0x18 <= len(img) and r not in seen and len(recs) < 2:
+        seen.add(r)
+        recs.append((tex.get(u32(img, r + LAYER_TEXTURE)), u32(img, r + LAYER_MODE), u32(img, r + LAYER_WORD)))
+        r = u32(img, r)
+    label = _MAT_LABEL.match(name.encode("ascii", "replace")) if name else None
+    out = []
+    if label:
+        settings = [int(label.group(4)), int(label.group(5))]
+        present = [(slot, s) for slot, s in zip((1, 2), settings) if s != -1 and s & 0xFF in NE_BLENDS]
+        if len(present) == len(recs):
+            for k, ((slot, s), (ti, mode, word)) in enumerate(zip(present, recs)):
+                blend = s & 0xFF
+                out.append({"position": slot, "texture": ti, "field": F_TEX1 + k, "blend": 2 if blend == 99 else blend,
+                            "flags": (s >> 9) & 0x1F, "caustic": (s >> 9) & 0x60, "mode": mode, "setting": s,
+                            "clamp": _clamp(word & 0xFF, (word >> 8) & 0xFF)})
+            return _place(out)
+    for k, (ti, mode, word) in enumerate(recs):
+        blend, flags = MODE_SE1.get(mode, (2, 4))
+        if word & LAYER_AFTERSHADOW:
+            flags |= 8
+        out.append({"position": k + 1, "texture": ti, "field": F_TEX1 + k, "blend": blend, "flags": flags,
+                    "caustic": {5: 0x20, 6: 0x60}.get(mode, 0), "mode": mode, "setting": None,
+                    "clamp": _clamp(word & 0xFF, (word >> 8) & 0xFF)})
+    return _place(out)
+
+
+def _clamp(u, v):
+    """NE's wrap bytes for U and V -> CLAMP_U | CLAMP_V (1 clamps; 2 mirrors,
+    which SE1 has not, and 0 repeats)."""
+    return (CLAMP_U if u == 1 else 0) | (CLAMP_V if v == 1 else 0)
+
+
+def _place(out):
+    """Which SE1 layer each texture layer goes on. Serious Engine keeps detail
+    maps on the third texture (layer 2) and blends and glows on the second, as
+    the designers' waterfallArea.wld does; NE's labels do not: of the lone
+    detail maps, 1,443 materials have theirs first and 831 second. So a Shade
+    layer goes on layer 2 and any other on layer 1; two of the same kind swap
+    places, the label's first on layer 2."""
+    if len(out) == 2 and (out[0]["blend"] == 1) == (out[1]["blend"] == 1):
+        out[0]["slot"], out[1]["slot"] = 2, 1
+    else:
+        for x in out:
+            x["slot"] = 2 if x["blend"] == 1 else 1
     return out
 
 
@@ -226,6 +312,7 @@ def materials(container):
             after = [s for s in secs if s > start]
             end = min(after) if after else len(img)
         m = _MAT_NAME.search(img[start:min(end, start + 0x400)])
+        name = m.group().decode("ascii", "replace") if m else None
         yield {
             "index": i,
             "kind": "material",
@@ -233,7 +320,9 @@ def materials(container):
             "end": end,
             "diffuse": tex.get(u32(img, start + MAT_DIFFUSE)),
             "second": tex.get(u32(img, start + MAT_SECOND)),
-            "name": m.group().decode("ascii", "replace") if m else None,
+            "layers": layers(img, start + MAT_LAYERS, tex, name),
+            "clamp": _clamp(img[start + MAT_CLAMP_U], img[start + MAT_CLAMP_V]),
+            "name": name,
             "xform": None,
         }
 
@@ -258,6 +347,7 @@ def sectors(container):
                 rows = (f[0:3], f[4:7], f[8:11])
                 trans = (f[3], f[7], f[11])
         m = _MAT_NAME.search(img[start:min(end, start + 0x400)])
+        name = m.group().decode("ascii", "replace") if m else None
         yield {
             "index": i,
             "kind": "sector",
@@ -265,7 +355,9 @@ def sectors(container):
             "end": end,
             "diffuse": tex.get(u32(img, start + SEC_DIFFUSE)),
             "second": None,
-            "name": m.group().decode("ascii", "replace") if m else None,
+            "layers": layers(img, start + SEC_LAYERS, tex, name),
+            "clamp": 0,                   # where a brush node keeps its wrap is not known
+            "name": name,
             "xform": (rows, trans) if rows else None,
         }
 
@@ -481,8 +573,11 @@ def cmd_materials(args) -> int:
         print(f"=== {path}: {len(ms)} materials "
               f"({named} named, {withtex} with a diffuse texture) ===")
         for m in ms[:args.limit]:
+            lays = " ".join("L%d=tex%s/b%d/f%x%s" % (x["slot"], x["texture"], x["blend"], x["flags"],
+                                                     "/caustic%x" % x["caustic"] if x["caustic"] else "")
+                            for x in m["layers"])
             print(f"  [{m['index']:>3}] tex={str(m['diffuse']):>4} "
-                  f"tris={counts.get(m['index'], 0):>6}  {m['name'] or ''}")
+                  f"tris={counts.get(m['index'], 0):>6}  {m['name'] or ''}  {lays}")
         if len(ms) > args.limit:
             print(f"  ... {len(ms) - args.limit} more")
         if -1 in counts:
@@ -494,7 +589,7 @@ def cmd_map(args) -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     for path in args.files:
         img = Container(path).image
-        pts = positions(img)
+        pts = [space.world(p) for p in positions(img)]
         if not pts:
             print(f"{path}: no position array")
             continue
@@ -531,7 +626,7 @@ def cmd_map(args) -> int:
                     put(cx + dx, cz + dz, rgb)
 
         for l in ls:                               # lights in red
-            lx, _, lz = l["pos"]
+            lx, _, lz = space.world(l["pos"])
             cx, cz = int(10 + (lx - x0) * s), int(10 + (lz - z0) * s)
             for dx in range(-2, 3):
                 for dz in range(-2, 3):
@@ -556,7 +651,7 @@ def cmd_obj(args) -> int:
         with dest.open("w") as fh:
             fh.write(f"# {path.name}: {len(pts)} vertices from CcArray[0]\n")
             fh.write("# every position, unconnected. Use 'mesh' for triangles.\n")
-            for x, y, z in pts:
+            for x, y, z in map(space.world, pts):
                 fh.write(f"v {x:.4f} {y:.4f} {z:.4f}\n")
         print(f"{path.name}: {len(pts):,} vertices -> {dest}")
     return 0
@@ -595,6 +690,19 @@ def cmd_mesh(args) -> int:
             if owner and key not in matinfo:
                 matinfo[key] = owner
 
+        # Faces are the rebuilt SE1 polygons (tools/polygons.py). OBJ has no
+        # holes, so a polygon with holes is written as its triangles.
+        if args.triangles:
+            faces = {key: list(tris) for key, tris in groups.items()}
+        else:
+            from polygons import polygons as rebuild     # it imports this module
+            faces = {}
+            for key, rec in rebuild(cont).items():
+                faces[key] = [p for poly in rec["polygons"]
+                              for p in (poly["loops"] if len(poly["loops"]) == 1
+                                        else poly["triangles"])]
+        nfaces = sum(len(f) for f in faces.values())
+
         # (position index, owning group) -> world-space vertex
         vkey: dict[tuple, int] = {}
         verts: list[tuple] = []
@@ -605,7 +713,7 @@ def cmd_mesh(args) -> int:
                     k = (v[F_POS], key if xf else None)
                     if k not in vkey:
                         vkey[k] = len(verts) + 1        # OBJ is 1-based
-                        verts.append(apply_xform(xf, pts[v[F_POS]]))
+                        verts.append(space.world(apply_xform(xf, pts[v[F_POS]])))
         used_uv = sorted({v[F_TEX0] for tl in groups.values() for t in tl
                           for v in t if v[F_TEX0] < len(uvs)})
         remap_uv = {v: i + 1 for i, v in enumerate(used_uv)}
@@ -620,10 +728,14 @@ def cmd_mesh(args) -> int:
             fh.write(f"# {path.name}\n")
             fh.write(f"# {nlists} display lists, {len(groups)} groups -> "
                      f"{total} triangles, {len(verts)} vertices\n")
+            fh.write("# faces: " + ("the triangles" if args.triangles else
+                     f"{nfaces} rebuilt polygons (tools/polygons.py; one with "
+                     f"holes is written as its triangles)") + "\n")
             fh.write(f"# texcoords from CcArray[{args.uv_array}] (TEX0); "
                      f"v is flipped for OBJ's bottom-left origin\n")
             fh.write(f"# {moved} triangles belong to movable sectors and are "
                      f"written in world space, not at the model origin\n")
+            fh.write("# original space: NE's z negated, faces reversed (tools/space.py)\n")
             fh.write(f"mtllib {mtl.name}\n")
             for x, y, z in verts:
                 fh.write(f"v {x:.4f} {y:.4f} {z:.4f}\n")
@@ -634,13 +746,14 @@ def cmd_mesh(args) -> int:
                 xf = matinfo.get(key, {}).get("xform")
                 fh.write(f"o {_gname(key)}\n" if xf else "")
                 fh.write(f"usemtl {_gname(key)}\n")
-                for tri in groups[key]:
-                    ids = [vkey[(v[F_POS], key if xf else None)] for v in tri]
-                    if all(v[F_TEX0] in remap_uv for v in tri):
+                for face in faces.get(key, ()):
+                    face = space.face(face)             # mirrored: keep the facing
+                    ids = [vkey[(v[F_POS], key if xf else None)] for v in face]
+                    if all(v[F_TEX0] in remap_uv for v in face):
                         textured += 1
                         fh.write("f " + " ".join(
                             f"{i}/{remap_uv[v[F_TEX0]]}"
-                            for i, v in zip(ids, tri)) + "\n")
+                            for i, v in zip(ids, face)) + "\n")
                     else:
                         fh.write("f " + " ".join(str(i) for i in ids) + "\n")
 
@@ -681,8 +794,8 @@ def cmd_mesh(args) -> int:
 
         nsec = sum(1 for k in groups if k[0] == "sector")
         print(f"{path.name}: {nlists} lists, {len(groups)} groups "
-              f"({nsec} movable), {total:,} triangles "
-              f"({textured * 100 // max(1, total)}% with UVs, {moved:,} "
+              f"({nsec} movable), {total:,} triangles -> {nfaces:,} faces "
+              f"({textured * 100 // max(1, nfaces)}% with UVs, {moved:,} "
               f"transformed), {len(verts):,} vertices, {len(used_uv):,} "
               f"texcoords, {len(wanted)} textures ({written} new) "
               f"-> {obj.name} + {mtl.name}")
@@ -713,7 +826,7 @@ def cmd_render(args) -> int:
             return v[int(n * lo / 100)], v[int(n * hi / 100)]
 
         x0, x1 = band([p[0] for p in pts])
-        z0, z1 = band([p[2] for p in pts])
+        z0, z1 = band([-p[2] for p in pts])          # original space: z negated
         W = args.size
         s = (W - 20) / max(1e-6, x1 - x0)
         H = max(64, min(4096, int((z1 - z0) * s) + 20))
@@ -749,7 +862,7 @@ def cmd_render(args) -> int:
                        for v in tri):
                     skipped += 1
                     continue
-                p3 = [apply_xform(xf, pts[v[F_POS]]) for v in tri]
+                p3 = [space.world(apply_xform(xf, pts[v[F_POS]])) for v in tri]
                 if sum(q[1] for q in p3) / 3.0 > ceiling:
                     skipped += 1
                     continue
@@ -869,6 +982,8 @@ def main() -> int:
                    help="texcoord array slot (4=TEX0 diffuse, 5, 6)")
     p.add_argument("--no-textures", action="store_true",
                    help="skip writing the PNGs the MTL references")
+    p.add_argument("--triangles", action="store_true",
+                   help="write the triangles instead of the rebuilt polygons")
     p.set_defaults(func=cmd_mesh)
 
     p = sub.add_parser("render",

@@ -13,8 +13,11 @@ orig/                  pristine disc contents — READ ONLY, never edit
 ghidra/                Ghidra project + scripts
   scripts/             import_dol.py and friends
 ref/serious-engine/    Croteam SE1 1.10 (GPL) — reference only, see caveat below
+dev/                   NE developer material (SE1 1.04 tools, entity DLLs, Maya
+                       .clm model sources) — READ ONLY, git-ignored, never commit
 pc/                    the PC port being built
   engine/              SeriousSamClassic-VK — the chosen SE1 fork, see pc/README.md
+  entities/            NE's own entity classes (EntitiesNE), see docs/enemies.md
 tools/                 DolphinTool, PyGhidra venv, GhidraMCP bridge venv
 docs/                  findings.md, toolchain.md, strategy.md
 ```
@@ -33,10 +36,17 @@ docs/                  findings.md, toolchain.md, strategy.md
 - `docs/strategy.md` — the chosen route and the ordered next steps.
 - `docs/world-conversion.md` — how a level becomes an SE1 world: sectors,
   lights, brush entities, and exactly which NE field feeds which SE1 property.
+- `docs/enemies.md` — NE's creatures: the TSE stand-ins, and the port of the
+  rest as SE1 classes (models baked from the disc, `pc/entities`, behaviour).
 - `docs/sound.md` — the DSP-ADPCM effects bank, the music and speech streams
   in `StreamData.dat`, and the hash tables entities use to name a sound.
 - `docs/text.md` — the `.tdb` text databases, the hashed lookup, and the
   NETRICSA messages MessageHolders carry.
+- `docs/gui.md` — `Game.Gui`, the menu layout: a `DXFF` relocatable blob of
+  328 components (`tools/gui.py`).
+- `docs/dev-material.md` — what is in `dev/`: the `.clm` model sources
+  (`tools/clm.py`) and the SE1 entity classes with every property named
+  (`tools/se1dll.py`), and how NE's classes map onto them.
 - `docs/toolchain.md` — how to run Ghidra headless, the MCP wiring, DolphinTool.
 
 ## The one thing that trips people up

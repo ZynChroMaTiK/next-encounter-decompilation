@@ -170,6 +170,125 @@ def cmd_decompile(args):
     shutdown()
 
 
+def _functions_in(program, start, end):
+    fm = program.getFunctionManager()
+    lo, hi = resolve(program, start), resolve(program, end)
+    for f in fm.getFunctions(lo, True):
+        if f.getEntryPoint().compareTo(hi) >= 0:
+            break
+        yield f
+
+
+def _strings_used(program, f):
+    """Defined strings a function's instructions reference, in order."""
+    listing, out = program.getListing(), []
+    for ins in listing.getInstructions(f.getBody(), True):
+        for r in ins.getReferencesFrom():
+            d = listing.getDataAt(r.getToAddress())
+            if d is not None and d.hasStringValue():
+                s = str(d.getValue())
+                if s not in out:
+                    out.append(s)
+    return out
+
+
+def cmd_range(args):
+    """Every function in [start, end): size, references to it, the strings it
+    uses and the named functions it calls -- a quick map of a code unit."""
+    program, _ = boot()
+    rm = program.getReferenceManager()
+    for f in _functions_in(program, args.start, args.end):
+        named = sorted({c.getName() for c in f.getCalledFunctions(None)
+                        if not c.getName().startswith("FUN_")})
+        print(f"{f.getEntryPoint()}  {f.getName():<32} size={f.getBody().getNumAddresses():<5} "
+              f"refs={rm.getReferenceCountTo(f.getEntryPoint())}"
+              + (f"  calls {', '.join(named)}" if named else ""))
+        for s in _strings_used(program, f):
+            print(f"      str {s[:args.width]!r}")
+    shutdown()
+
+
+def cmd_dump(args):
+    """Decompile every function in [start, end) into one file."""
+    program, _ = boot()
+    n = 0
+    with open(args.output, "w", encoding="utf-8") as fh:
+        for f in _functions_in(program, args.start, args.end):
+            c, err = _decompile(program, f)
+            fh.write(f"// ==== {f.getName()} @ {f.getEntryPoint()} ====\n")
+            fh.write((c if c else f"// decompile failed: {err}") + "\n\n")
+            n += 1
+    print(f"{n} functions -> {args.output}")
+    shutdown()
+
+
+def cmd_vtable(args):
+    """A CodeWarrior vtable of 8-byte entries {s16 this-adjust, 0, function}.
+    A call reads the adjust at +8k and the function at +8k+4:
+    (*(vt + 0x194))(this + *(short *)(vt + 0x190)). Stops after two entries
+    in a row that are not function pointers."""
+    program, _ = boot()
+    mem = program.getMemory()
+    fm = program.getFunctionManager()
+    af = program.getAddressFactory()
+    addr = resolve(program, args.target)
+    misses = 0
+    for i in range(args.count):
+        a = addr.add(8 * i)
+        adj = mem.getShort(a)
+        fp = mem.getInt(a.add(4)) & 0xFFFFFFFF
+        if not (0x80003100 <= fp < 0x80300000):
+            print(f"  +0x{8 * i + 4:03x}  {fp:08x}")
+            misses += 1
+            if misses == 2:
+                break
+            continue
+        misses = 0
+        f = fm.getFunctionAt(af.getAddress(f"{fp:08x}"))
+        name = f.getName() if f is not None else "(no function)"
+        print(f"  +0x{8 * i + 4:03x}  {fp:08x} adj {adj:<4} {name}")
+    shutdown()
+
+
+def cmd_mkfunc(args):
+    """Create functions at every function pointer of a CodeWarrior vtable (and
+    at any extra addresses). Small virtual methods reached only through a
+    vtable are never made functions by auto-analysis, so they do not decompile."""
+    if not args.write:
+        raise SystemExit("error: mkfunc requires --write")
+    program, api = boot(write=True)
+    mem = program.getMemory()
+    af = program.getAddressFactory()
+    targets = []
+    if args.vtable:
+        base = resolve(program, args.vtable)
+        misses = 0
+        for i in range(args.count):
+            fp = mem.getInt(base.add(8 * i + 4)) & 0xFFFFFFFF
+            if not (0x80003100 <= fp < 0x80300000):
+                misses += 1
+                if misses == 2:
+                    break
+                continue
+            misses = 0
+            targets.append(af.getAddress(f"{fp:08x}"))
+    targets += [resolve(program, t) for t in args.addresses]
+    tx = program.startTransaction("mkfunc")
+    made = 0
+    try:
+        for addr in targets:
+            f = func_at(program, addr)
+            if f is not None and f.getEntryPoint() == addr:
+                continue
+            api.disassemble(addr)
+            if api.createFunction(addr, None) is not None:
+                made += 1
+    finally:
+        program.endTransaction(tx, True)
+    print(f"{len(targets)} targets, {made} functions created")
+    shutdown(save=True)
+
+
 def cmd_disasm(args):
     program, _ = boot()
     addr = resolve(program, args.target)
@@ -314,6 +433,29 @@ def main() -> int:
     p.add_argument("targets", nargs="+")
     p.add_argument("--name-only", action="store_true")
     p.set_defaults(func=cmd_decompile)
+
+    p = sub.add_parser("range", help="functions in [start, end) with strings and named calls")
+    p.add_argument("start")
+    p.add_argument("end")
+    p.add_argument("--width", type=int, default=90)
+    p.set_defaults(func=cmd_range)
+
+    p = sub.add_parser("dump", help="decompile every function in [start, end) to a file")
+    p.add_argument("start")
+    p.add_argument("end")
+    p.add_argument("-o", "--output", required=True)
+    p.set_defaults(func=cmd_dump)
+
+    p = sub.add_parser("vtable", help="a CodeWarrior vtable's {function, adjust} pairs")
+    p.add_argument("target")
+    p.add_argument("--count", type=int, default=120)
+    p.set_defaults(func=cmd_vtable)
+
+    p = sub.add_parser("mkfunc", help="create functions at a vtable's entries and/or addresses (writes the DB)")
+    p.add_argument("addresses", nargs="*")
+    p.add_argument("--vtable")
+    p.add_argument("--count", type=int, default=160)
+    p.set_defaults(func=cmd_mkfunc)
 
     p = sub.add_parser("disasm", help="linear disassembly")
     p.add_argument("target")

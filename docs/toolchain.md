@@ -64,6 +64,34 @@ Until then, two workarounds recover paired-single code:
   quantization registers, which set the scale of each `psq_l`. The
   animation key decode (`0x80129334`) was read this way.
 
+## Reading the developer material (`dev/`)
+
+Both tools read `dev/` in place and write only under `build/dev/`
+(`docs/dev-material.md`).
+
+- **`python tools/clm.py verify | tree FILE | meshes FILE...`** parses
+  Climax's `.clm` Maya exports. There are no dependencies.
+- **`python tools/se1dll.py dump | list | show CLASS`** recovers the SE1
+  1.04 entity classes, their property tables and their enums from the
+  entity DLLs. The tables are built by static initializers, so it emulates
+  the x86 code. It needs **capstone**: `python -m pip install capstone`.
+
+## RAM dumps
+
+To see runtime state the disc doesn't hold:
+1. Start the game in Dolphin (`tools/Dolphin-x64`) with the debugging UI on
+   (Options → Configuration → Interface → "Enable Debugging UI").
+2. Go into a level.
+3. Use Debug → Memory → "Dump MEM1". Dolphin writes
+   `%APPDATA%/Dolphin Emulator/Dump/mem1.raw`: 24 MiB, the RAM from
+   0x80000000.
+4. Copy it to `build/ramdump/`, which is git-ignored.
+
+**`python tools/ramdump.py info`** first identifies the loaded level and
+where its image sits in RAM. It then checks that every relocated pointer
+equals the base plus its on-disc value, and prints the scene's render
+objects, the TouchField and Bouncer tables, and each TouchField entity.
+
 ## Driving Ghidra from Python (headless)
 
 This is the general lever — anything the Ghidra API can do:
@@ -111,3 +139,49 @@ was emptied. The jar is still compiled against 11.3 APIs, so it may still throw
 at runtime. If it does, rebuild GhidraMCP from source against 12.1.2 — or just
 use the PyGhidra path above, which is strictly more capable and has no version
 coupling.
+
+## Building the engine (`pc/engine`)
+
+`pc\build-windows.ps1` builds the fork's `SamTSE.sln`, Release x64, with the
+installed VS 2022 Build Tools (MSVC v143, ATL/MFC) and the Vulkan SDK.
+`-Target Engine` builds one project. Setup, overrides and outputs are in
+`pc/README.md`.
+
+## NE's creatures as SE1 models and classes
+
+`python tools/creature.py export <name>` bakes a creature's animations from
+the disc into OBJ frames, its texture and a modeler script under
+`SamTSE/Models/NextEncounter/Enemies/<name>/`. `WldWriter --mdl <script>
+<model>` builds the `.mdl` and its animation header with the engine's own
+modeler code; `WldWriter --mdlinfo <model> <txt>` lists a model's
+animations, frame boxes, first-frame vertices and polygons for checking;
+`python tools/creature.py check <name>` runs it and compares every polygon
+corner's texture coordinates with the bind-pose OBJ.
+`pc\build-windows.ps1 -Entities` builds the classes in `pc/entities`
+(`docs/enemies.md`).
+
+## Converting a level to a world (Stage 2)
+
+`python tools/wldtex.py` writes every level texture a polygon uses as a TGA
+under `pc/engine/SamTSE/Textures/NextEncounter`, and `WldWriter.exe --tex
+build/wld/textures.lst` turns them into `.tex`; worlds need those first.
+`python tools/wldprep.py --all` flattens each description into
+`build/wld/<level>.wldsrc` (copying the sounds, music and messages its
+entities name under `SamTSE/Sounds`, `Music` and `Data/Messages`), with the polygons rebuilt from the level's
+triangles (`tools/polygons.py`) and the world base cut into rooms joined by
+portals, built from its whole polygons (`tools/rooms.py`;
+`python tools/rooms.py render <level>` draws them in an oblique view into
+`build/render/`). `pc\build-windows.ps1 -Writer` builds
+`pc/wldwriter` into `pc/engine/SamTSE/Bin`, and `WldWriter.exe <file>.wldsrc`
+writes `SamTSE/Levels/NextEncounter/<level>.wld`. `--check` loads a world back
+and links its portals as the renderer does,
+`--rays` casts test rays through it, `--tri` re-triangulates every polygon as
+the editor does and names the ones it rejects, and `--dump <wld> <txt>` lists
+a world's polygons with every texture layer's settings and mapping
+(`tools/devworld.py` runs it on a `dev/` world). The writer bakes each world's
+shadow maps from its lights before saving; `--lightmap <wld> <txt>` dumps
+every polygon's mixed shadow map, and `python tools/lightmap.py render <level>`
+draws it beside the level's own baked lightmap, with their difference, into
+`build/render/<level>_lightmap.png` (the dump runs to hundreds of MB on large
+levels). The writer needs the retail data and a
+game ID; see `docs/world-conversion.md`, "What the writer needs at run time".

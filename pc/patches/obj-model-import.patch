@@ -1,0 +1,401 @@
+diff --git a/SamTSE/Sources/Engine/Math/Object3D_IO.cpp b/SamTSE/Sources/Engine/Math/Object3D_IO.cpp
+index 9f226b3..fd1b33c 100644
+--- a/SamTSE/Sources/Engine/Math/Object3D_IO.cpp
++++ b/SamTSE/Sources/Engine/Math/Object3D_IO.cpp
+@@ -203,10 +203,134 @@ void CObject3D::BatchLoading_t(BOOL bOn)
+   }
+   _bBatchLoading = bOn;
+ #else
+-  throw("3D Exploration is disabled in this build.");
++  // Without Exploration 3D, LoadAny3DFormat_t reads Wavefront OBJ itself and
++  // needs no library or window: batch loading is nothing to start or stop.
++  (void)bOn;
+ #endif
+ }
+ 
++#if !USE_E3D
++/*
++ * Wavefront OBJ into the conversion arrays, the way FillConversionArrays_t
++ * takes an Exploration 3D object: vertices through mTransform and then x and z
++ * negated, faces flipped when mTransform mirrors, one material per usemtl
++ * name in order of first use. Faces with more than three corners are fans.
++ */
++static void FillConversionArraysOBJ_t(const CTFileName &fnmFileName, const FLOATmatrix3D &mTransform)
++{
++  const FLOATmatrix3D &m = mTransform;
++  FLOAT fDet =
++    m(1,1)*(m(2,2)*m(3,3)-m(2,3)*m(3,2))+
++    m(1,2)*(m(2,3)*m(3,1)-m(2,1)*m(3,3))+
++    m(1,3)*(m(2,1)*m(3,2)-m(2,2)*m(3,1));
++  BOOL bFlipped = fDet<0;
++
++  CStaticStackArray<FLOAT3D> avPos;
++  CStaticStackArray<FLOAT2D> avUV;
++  CStaticStackArray<ConversionTriangle> actTris;
++  CTString astrMaterials[256];      // usemtl names, in order of first use
++  INDEX ctMaterials = 0;
++  INDEX iMaterial = -1;
++
++  CTFileStream strm;
++  strm.Open_t(fnmFileName);
++  char achLine[1024];
++  while (!strm.AtEOF()) {
++    strm.GetLine_t(achLine, sizeof(achLine));
++    char *pch = achLine;
++    while (*pch==' ' || *pch=='\t') { pch++; }
++    if (pch[0]=='v' && (pch[1]==' ' || pch[1]=='\t')) {
++      FLOAT3D v(0,0,0);
++      sscanf(pch+2, "%f %f %f", &v(1), &v(2), &v(3));
++      avPos.Push() = v;
++    } else if (pch[0]=='v' && pch[1]=='t' && (pch[2]==' ' || pch[2]=='\t')) {
++      FLOAT2D t(0,0);
++      sscanf(pch+3, "%f %f", &t(1), &t(2));
++      avUV.Push() = t;
++    } else if (strncmp(pch, "usemtl", 6)==0) {
++      char achName[256] = "Default";
++      sscanf(pch+6, "%255s", achName);
++      iMaterial = -1;
++      for (INDEX i=0; i<ctMaterials; i++) {
++        if (astrMaterials[i]==CTString(achName)) { iMaterial = i; }
++      }
++      if (iMaterial<0) {
++        if (ctMaterials>=256) { ThrowF_t("%s: more than 256 materials", (const char *)fnmFileName); }
++        astrMaterials[ctMaterials] = CTString(achName);
++        iMaterial = ctMaterials++;
++      }
++    } else if (pch[0]=='f' && (pch[1]==' ' || pch[1]=='\t')) {
++      INDEX aiV[64], aiT[64], ct = 0;
++      char *pchTok = pch+2;
++      while (ct<64) {
++        while (*pchTok==' ' || *pchTok=='\t') { pchTok++; }
++        if (*pchTok==0 || *pchTok=='\r' || *pchTok=='\n') { break; }
++        INDEX iV = 0, iT = 0;
++        sscanf(pchTok, "%d", &iV);
++        char *pchSlash = pchTok;
++        while (*pchSlash && *pchSlash!='/' && *pchSlash!=' ' && *pchSlash!='\t') { pchSlash++; }
++        if (*pchSlash=='/' && pchSlash[1]!='/') { sscanf(pchSlash+1, "%d", &iT); }
++        aiV[ct] = iV<0 ? avPos.Count()+iV : iV-1;
++        aiT[ct] = iT<0 ? avUV.Count()+iT : iT-1;
++        ct++;
++        while (*pchTok && *pchTok!=' ' && *pchTok!='\t') { pchTok++; }
++      }
++      if (iMaterial<0) {
++        astrMaterials[ctMaterials] = CTString("Default");
++        iMaterial = ctMaterials++;
++      }
++      for (INDEX i=1; i+1<ct; i++) {
++        ConversionTriangle &ctri = actTris.Push();
++        INDEX aiCorner[3] = {0, i, i+1};
++        for (INDEX k=0; k<3; k++) {
++          INDEX c = aiCorner[bFlipped ? 2-k : k];
++          ctri.ct_iVtx[k] = aiV[c];
++          ctri.ct_iTVtx[k] = aiT[c]<0 ? 0 : aiT[c];
++        }
++        ctri.ct_iMaterial = iMaterial;
++      }
++    }
++  }
++
++  avVertices.New(avPos.Count());
++  for (INDEX iVtx=0; iVtx<avPos.Count(); iVtx++) {
++    avVertices[iVtx] = avPos[iVtx]*mTransform;
++    avVertices[iVtx](1) = -avVertices[iVtx](1);
++    avVertices[iVtx](3) = -avVertices[iVtx](3);
++  }
++  avTextureVertices.New(avUV.Count()>0 ? avUV.Count() : 1);
++  if (avUV.Count()==0) { avTextureVertices[0] = FLOAT2D(0,0); }
++  // Exploration 3D gave v negated: rebuilt from the designers' MonkeyMan.obj,
++  // this matches their MonkeyMan.mdl corner for corner only with -v
++  for (INDEX iTVtx=0; iTVtx<avUV.Count(); iTVtx++) {
++    avTextureVertices[iTVtx] = FLOAT2D(avUV[iTVtx](1), -avUV[iTVtx](2));
++  }
++  actTriangles.New(actTris.Count());
++  for (INDEX iMat=0; iMat<ctMaterials; iMat++) {
++    ConversionMaterial *pcm = new ConversionMaterial;
++    pcm->cm_ulTag = iMat;
++    pcm->cm_strName = astrMaterials[iMat];
++    pcm->cm_colColor = C_GRAY;
++    acmMaterials.Add(pcm);
++  }
++  acmMaterials.Lock();
++  for (INDEX iTri=0; iTri<actTris.Count(); iTri++) {
++    const ConversionTriangle &ctri = actTris[iTri];
++    for (INDEX k=0; k<3; k++) {
++      if (ctri.ct_iVtx[k]<0 || ctri.ct_iVtx[k]>=avPos.Count()) {
++        acmMaterials.Unlock();
++        ThrowF_t("%s: a face names vertex %d of %d", (const char *)fnmFileName, ctri.ct_iVtx[k]+1, avPos.Count());
++      }
++    }
++    actTriangles[iTri] = ctri;
++    INDEX *piTri = new INDEX(1);
++    *piTri = iTri;
++    acmMaterials[ctri.ct_iMaterial].ms_Polygons.Add(piTri);
++  }
++  acmMaterials.Unlock();
++}
++#endif
++
+ void CObject3D::LoadAny3DFormat_t(
+   const CTFileName &fnmFileName,
+   const FLOATmatrix3D &mTransform,
+@@ -269,6 +393,35 @@ void CObject3D::LoadAny3DFormat_t(
+     }
+     throw;
+   }
++#else
++  // Exploration 3D is not in this build: read Wavefront OBJ
++  if (fnmFileName.FileExt()!=".obj" && fnmFileName.FileExt()!=".OBJ") {
++    ThrowF_t("Unable to load 3D object: %s (only .obj without Exploration 3D)", (const char *)fnmFileName);
++  }
++  try {
++    FillConversionArraysOBJ_t(fnmFileName, mTransform);
++    switch( ltLoadType)
++    {
++    case LT_NORMAL:
++      ConvertArraysToO3D();
++      break;
++    case LT_OPENED:
++      RemapVertices(TRUE);
++      ConvertArraysToO3D();
++      break;
++    case LT_UNWRAPPED:
++      if( avTextureVertices.Count() <= 1) {
++        ThrowF_t("Unable to import mapping from 3D object because it doesn't contain mapping coordinates.");
++      }
++      RemapVertices(FALSE);
++      ConvertArraysToO3D();
++      break;
++    }
++  } catch (const char *) {
++    ClearConversionArrays();
++    throw;
++  }
++  ClearConversionArrays();
+ #endif
+ }
+ 
+@@ -441,6 +594,13 @@ void RemapVertices(BOOL bAsOpened)
+   INDEX ctVertices = avVertices.Count();
+   aiRemap.New(ctVertices);
+ 
++  // One remapped vertex per vertex AND texture vertex in a surface. Keyed on
++  // the vertex alone, as it was, a vertex on a UV seam inside one surface got
++  // the texture coordinate of the first polygon naming it, and every other
++  // polygon along the seam was mapped with it. aiRemap holds the first of a
++  // vertex's (texture vertex, remap) entries, chained through aiNext.
++  CStaticStackArray<INDEX> aiEntryTVtx, aiEntryRemap, aiNext;
++
+   // fill remap array with indices of vertices in order how they appear per polygons
+   FOREACHINDYNAMICCONTAINER(acmMaterials, ConversionMaterial, itcm)
+   {
+@@ -449,6 +609,9 @@ void RemapVertices(BOOL bAsOpened)
+     {
+       aiRemap[iRemap] = -1;
+     }
++    aiEntryTVtx.PopAll();
++    aiEntryRemap.PopAll();
++    aiNext.PopAll();
+     // reset 'vertex in surface' counter
+     INDEX ctvx = 0;
+ 
+@@ -459,11 +622,20 @@ void RemapVertices(BOOL bAsOpened)
+       // for each vertex in polygon
+       for(INDEX iVtx=0; iVtx<3; iVtx++)
+       {
+-        // get vertex's index
++        // get vertex's index and its texture vertex here
+         INDEX idxVtx = actTriangles[idxPol].ct_iVtx[iVtx];
+-        if( aiRemap[idxVtx] == -1)
++        INDEX idxTVtx = actTriangles[idxPol].ct_iTVtx[iVtx];
++        INDEX iEntry = aiRemap[idxVtx];
++        while( iEntry != -1 && aiEntryTVtx[iEntry] != idxTVtx)
++        {
++          iEntry = aiNext[iEntry];
++        }
++        if( iEntry == -1)
+         {
+-          aiRemap[idxVtx] = ctvx;
++          aiEntryTVtx.Push() = idxTVtx;
++          aiEntryRemap.Push() = ctvx;
++          aiNext.Push() = aiRemap[idxVtx];
++          aiRemap[idxVtx] = aiEntryTVtx.Count()-1;
+           ctvx++;
+         }
+       }
+@@ -482,8 +654,13 @@ void RemapVertices(BOOL bAsOpened)
+       {
+         // get vertex's index
+         INDEX idxVtx = actTriangles[iPol].ct_iVtx[iVtx];
+-        // get remapped index
+-        INDEX iRemap = aiRemap[idxVtx];
++        // get remapped index of this vertex with this texture vertex
++        INDEX iEntry = aiRemap[idxVtx];
++        while( aiEntryTVtx[iEntry] != actTriangles[iPol].ct_iTVtx[iVtx])
++        {
++          iEntry = aiNext[iEntry];
++        }
++        INDEX iRemap = aiEntryRemap[iEntry];
+         // if cutting object
+         if( bAsOpened)
+         {
+diff --git a/SamTSE/Sources/Engine/Models/EditModel.cpp b/SamTSE/Sources/Engine/Models/EditModel.cpp
+index ac26fa9..b3bfc1a 100644
+--- a/SamTSE/Sources/Engine/Models/EditModel.cpp
++++ b/SamTSE/Sources/Engine/Models/EditModel.cpp
+@@ -28,6 +28,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include <Engine/Templates/StaticArray.cpp>
+ #include <Engine/Templates/DynamicArray.cpp>
++#include <Engine/Templates/StaticStackArray.cpp>
+ #include <Engine/Templates/Stock_CTextureData.h>
+ 
+ // Globally instanciated object containing routines for dealing with progres messages
+@@ -934,6 +935,130 @@ void CEditModel::CreateScriptFile_t(CTFileName &fnO3D) // throw char *
+  */
+ #define EQUAL_SUB_STR( str) (strnicmp( ld_line, str, strlen(str)) == 0)
+ 
++/*
++ * Mapping imported from the one object the main mip model was made of.
++ *
++ * The opened and unwrapped objects are that object again (LoadAny3DFormat_t
++ * with LT_OPENED and LT_UNWRAPPED), so their polygons and corners come in the
++ * same order as the model's mip-0 polygons, and each corner of the unwrapped
++ * object holds that corner's texture coordinates (RemapVertices keys a
++ * vertex on its texture vertex too). So every polygon corner takes the
++ * coordinates of the same corner, and a vertex that carries several in one
++ * surface - a UV seam - gets a texture vertex for each. CalculateUnwrappedMapping
++ * matched texture vertices by position instead, one per vertex a surface: on
++ * a model with one material, the polygons along every seam were mapped with
++ * the other side's coordinates.
++ */
++static void CalculateImportedMapping( CModelData &md, CObject3D &o3dOpened, CObject3D &o3dUnwrapped) // throw char *
++{
++  ModelMipInfo *pMMI = &md.md_MipInfos[0];
++  INDEX ctPolygons = pMMI->mmpi_Polygons.Count();
++  INDEX ctCorners = 0;
++  for( INDEX iPol=0; iPol<ctPolygons; iPol++) {
++    ctCorners += pMMI->mmpi_Polygons[iPol].mp_PolygonVertices.Count();
++  }
++
++  // the texture vertices to make: candidates chained per transformed vertex
++  CStaticStackArray<ModelTextureVertex> amtvNew;
++  CStaticStackArray<INDEX> aiNewSurface, aiNext;
++  CStaticArray<INDEX> aiFirst;
++  aiFirst.New( md.md_VerticesCt);
++  for( INDEX iVtx=0; iVtx<md.md_VerticesCt; iVtx++) {
++    aiFirst[iVtx] = -1;
++  }
++  CStaticArray<INDEX> aiCornerTexture;
++  aiCornerTexture.New( ctCorners);
++
++  o3dOpened.ob_aoscSectors.Lock();
++  o3dUnwrapped.ob_aoscSectors.Lock();
++  CObjectSector &oscOpened = o3dOpened.ob_aoscSectors[0];
++  CObjectSector &oscUnwrapped = o3dUnwrapped.ob_aoscSectors[0];
++  oscOpened.LockAll();
++  oscUnwrapped.LockAll();
++  INDEX iCorner = 0;
++  for( INDEX iPol=0; iPol<ctPolygons; iPol++)
++  {
++    ModelPolygon &mp = pMMI->mmpi_Polygons[iPol];
++    CObjectPolygon &opo = oscOpened.osc_aopoPolygons[iPol];
++    INDEX ctPolyCorners = mp.mp_PolygonVertices.Count();
++    if( opo.opo_PolygonEdges.Count() != ctPolyCorners) {
++      oscOpened.UnlockAll();
++      oscUnwrapped.UnlockAll();
++      o3dOpened.ob_aoscSectors.Unlock();
++      o3dUnwrapped.ob_aoscSectors.Unlock();
++      ThrowF_t("ERROR: Polygon %d has %d vertices in the model and %d in the object that defines its mapping!",
++        iPol, ctPolyCorners, opo.opo_PolygonEdges.Count());
++    }
++    opo.opo_PolygonEdges.Lock();
++    for( INDEX iPolyCorner=0; iPolyCorner<ctPolyCorners; iPolyCorner++)
++    {
++      // this corner in the opened object, and its coordinates in the unwrapped one
++      CObjectPolygonEdge &ope = opo.opo_PolygonEdges[iPolyCorner];
++      CObjectVertex *povOpened = ope.ope_Backward ? ope.ope_Edge->oed_Vertex1 : ope.ope_Edge->oed_Vertex0;
++      INDEX iOpened = oscOpened.osc_aovxVertices.Index( povOpened);
++      FLOAT3D vUVW = DOUBLEtoFLOAT( oscUnwrapped.osc_aovxVertices[ iOpened]);
++      vUVW(2) = -vUVW(2);
++      MEX2D mexUV;
++      mexUV(1) = MEX_METERS( vUVW(1));
++      mexUV(2) = MEX_METERS( vUVW(2));
++
++      // the texture vertex with this vertex, surface and coordinates, or a new one
++      ModelPolygonVertex &mpv = mp.mp_PolygonVertices[iPolyCorner];
++      INDEX iTransformed = md.md_TransformedVertices.Index( mpv.mpv_ptvTransformedVertex);
++      INDEX iTexture = aiFirst[iTransformed];
++      while( iTexture != -1 && !(aiNewSurface[iTexture] == mp.mp_Surface
++        && amtvNew[iTexture].mtv_UV(1) == mexUV(1) && amtvNew[iTexture].mtv_UV(2) == mexUV(2)))
++      {
++        iTexture = aiNext[iTexture];
++      }
++      if( iTexture == -1)
++      {
++        ModelTextureVertex &mtv = amtvNew.Push();
++        mtv = *mpv.mpv_ptvTextureVertex;
++        mtv.mtv_UVW = vUVW;
++        mtv.mtv_UV = mexUV;
++        mtv.mtv_iTransformedVertex = iTransformed;
++        aiNewSurface.Push() = mp.mp_Surface;
++        aiNext.Push() = aiFirst[iTransformed];
++        iTexture = amtvNew.Count()-1;
++        aiFirst[iTransformed] = iTexture;
++      }
++      aiCornerTexture[iCorner++] = iTexture;
++    }
++    opo.opo_PolygonEdges.Unlock();
++  }
++  oscOpened.UnlockAll();
++  oscUnwrapped.UnlockAll();
++  o3dOpened.ob_aoscSectors.Unlock();
++  o3dUnwrapped.ob_aoscSectors.Unlock();
++
++  // replace the texture vertices and point every corner at its own
++  pMMI->mmpi_TextureVertices.Clear();
++  pMMI->mmpi_TextureVertices.New( amtvNew.Count());
++  for( INDEX iTexture=0; iTexture<amtvNew.Count(); iTexture++) {
++    pMMI->mmpi_TextureVertices[iTexture] = amtvNew[iTexture];
++  }
++  iCorner = 0;
++  for( INDEX iPol=0; iPol<ctPolygons; iPol++)
++  {
++    ModelPolygon &mp = pMMI->mmpi_Polygons[iPol];
++    for( INDEX iPolyCorner=0; iPolyCorner<mp.mp_PolygonVertices.Count(); iPolyCorner++) {
++      mp.mp_PolygonVertices[iPolyCorner].mpv_ptvTextureVertex = &pMMI->mmpi_TextureVertices[ aiCornerTexture[iCorner++]];
++    }
++  }
++  // each surface's polygons and texture vertices again
++  md.LinkDataForSurfaces(TRUE);
++
++  // reset surface position, rotation and zoom, as CalculateUnwrappedMapping does
++  for( INDEX iSurface=0; iSurface<pMMI->mmpi_MappingSurfaces.Count(); iSurface++)
++  {
++    MappingSurface &ms = pMMI->mmpi_MappingSurfaces[iSurface];
++    ms.ms_HPB = FLOAT3D( 0.0f, 0.0f, 0.0f);
++    ms.ms_Zoom = 1.0f;
++    ms.ms_vSurface2DOffset = FLOAT3D( 0.0f, 0.0f, 0.0f);
++  }
++}
++
+ void CEditModel::LoadFromScript_t(CTFileName &fnScriptName) // throw char *
+ {
+   try {
+@@ -1286,7 +1411,16 @@ void CEditModel::LoadFromScript_t(CTFileName &fnScriptName) // throw char *
+     o3dOpened.ob_aoscSectors.Unlock();
+     o3dUnwrapped.ob_aoscSectors.Unlock();
+ 
+-    CalculateUnwrappedMapping( o3dClosed, o3dOpened, o3dUnwrapped);
++    if( (fnClosed != "") && (fnOpened != "") && (fnUnwrapped != "") )
++    {
++      // three separate objects: matched by vertex position, as before
++      CalculateUnwrappedMapping( o3dClosed, o3dOpened, o3dUnwrapped);
++    }
++    else
++    {
++      // one object: corner for corner, with seams kept
++      CalculateImportedMapping( edm_md, o3dOpened, o3dUnwrapped);
++    }
+     CalculateMappingForMips();
+   }
+   else

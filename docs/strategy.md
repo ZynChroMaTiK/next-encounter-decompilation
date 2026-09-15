@@ -94,7 +94,7 @@ Asset names survive as plain strings inside the image, which gives a way in:
 | `.sst` | standalone textures (17 files) | loader named (`CcRes_Texture_Load`); same `CcTexture` node |
 | `.spt` / `.spd` | DSP-ADPCM effects bank, 540 samples | **decoded**: `tools/sound.py` writes WAVs, verified exactly against the stored loop history; entities name sounds by hash (`docs/sound.md`) |
 | `.bik` | Bink video (35 files) | standard RAD format, playable with existing tools |
-| `Game.Gui` | `DXFF` magic | unexamined |
+| `Game.Gui` | `DXFF` magic | **container decoded**: a relocatable blob of 328 menu components, each with a common header (kind, screen, position, colour) and bindings to config keys and sprites; no text of its own. `tools/gui.py`, `docs/gui.md` |
 | `StreamData.dat` | music and speech, 441 DSP-ADPCM channels | **decoded**: table at `main.dol 0x802411f8`; 11 music tracks as 3 stereo intensity layers (voices interleaved in 0x2380-byte chunks), 375 speech lines in 3 language blocks, of which German is a copy of English; `tools/sound.py streams` |
 | `opening.bnr` | `BNR1` GameCube banner | standard format |
 
@@ -230,8 +230,9 @@ Next:
     tree including `Ecc`, the entity class compiler the route needs in order to
     add entity classes. Same 144 `EntitiesMP` classes as the reference tree, so
     the ruleset diff carries over. Rationale, the alternatives considered, and
-    the build prerequisites are in `pc/README.md`. **Nothing is compiled yet**:
-    the machine has no C++ toolset and no Vulkan SDK.
+    the build prerequisites are in `pc/README.md`. **The whole solution
+    builds** (2026-09-11: VS 2022 Build Tools, v143, Vulkan SDK 1.4;
+    `pc/build-windows.ps1`).
 13. ~~Decode the `.clm` mesh format~~ — `tools/model.py`. `CcMesh` nodes at
     `image+0x5c` hold their own arrays and materials, and GX display lists of
     vertex type 2 (stride 8). 503 meshes (369 models plus 134 damage
@@ -250,11 +251,13 @@ Next:
     (`tools/world.py`) is done and verified on all 49 levels: 2,285 water/lava
     region cells, 1,209 brush entities (all 958 Movers and all 116
     DestroyableArch), TouchField and Bouncer properties, 20,210 lights mapped onto
-    `Light.es` properties (20,158 to create). Stage 2, the `.wld` writer, is
-    specified against the engine headers but blocked on the C++ toolset.
+    `Light.es` properties (14,695 to create, baked into every world by
+    Stage 2 and checked against NE's own baked lightmap). Stage 2, the `.wld` writer, is
+    specified against the engine headers; the engine now builds, so it can be
+    written and compiled.
     NE's region BSP is decoded — content, underwater reverb and fog become SE1
-    content sectors and `HazeMarker`s. Still open: gravity, and TouchField and
-    Bouncer volumes.
+    content sectors and `HazeMarker`s. TouchField and Bouncer volumes are
+    found (below). Still open: gravity.
 16. **Scripting graph** — decoded: 27,151 entity-id links (99.98% resolve)
     covering triggers (SE1's own 10-target layout), waves → enemy templates →
     death triggers, watchers, patrol paths, copiers and doors
@@ -262,8 +265,25 @@ Next:
     game's own `MovingBrush`, and its keyframes map one to one onto SE1's
     `MovingBrushMarker` chain, with time, wait and stop copied unconverted.
     That covers 958 movers and 2,016 markers, checked against the game's code
-    and by rendering (`docs/world-conversion.md`). Camera paths are the largest
-    props still undecoded.
+    and by rendering (`docs/world-conversion.md`). Camera paths are decoded
+    too: SE1's `Camera` → `CameraMarker` chain packed into the props, a
+    Kochanek–Bartels spline. That covers 171 cameras and 326 markers,
+    checked against the game's update code. They also show that every NE
+    placement matrix is the SE1 editor's rotation as `S_z · R · S_x`:
+    - NE's world is the original mirrored in Z, confirmed by eye against the
+      game;
+    - every model is mirrored in X, confirmed against the `dev/` sources.
+    All exporters now write the original space (`tools/space.py`;
+    `docs/world-conversion.md`, "Axes").
+
+    **TouchField volumes** are found too. They are the level collision
+    mesh's trigger triangles (flag 0x40, the field's index in the value),
+    found through a RAM dump and checked statically. 428 of 444 fields have
+    one, 426 of them closed (`tools/collision.py`). **Bouncer volumes** are
+    the same mesh's solid pad triangles whose value is `0x200 | index`: 64 of
+    64 bouncers have one. The game's hit-copy code (`0x80140e28`) turns that
+    value bit into hit type 1, which `Collision_HandleHits` hands to
+    `Bouncer_GetPush`.
 17. **Object models** — the enemies, characters, pickups and weapon rigs are
     decoded as geometry: 2,226 nested images across the 63 containers, 261
     names, 711 distinct by content (exported as OBJ with textures), 0 bad
@@ -280,7 +300,23 @@ Next:
     - Checked three ways: exact data tests, edge stretch against the wrong
       reading, and posed renders (`tools/objmodel.py pose`).
 
-    **Open:** a few characters leave vertices in no skin group (KleerKnight
-    807 of 1,409). And the SE1 form is still to choose: the keys bake
-    straight into `.mdl` vertex animation, while SKA would need a skeleton
-    NE never stores.
+    The vertices in no skin group (KleerKnight 807 of 1,409) are explained
+    by the developer sources: they are rigid propellers and a leftover
+    second body that the exporter appended (`docs/dev-material.md`).
+    **Open:** the SE1 form. The keys bake straight into `.mdl` vertex
+    animation. SKA would need a skeleton; NE never stores one, but the
+    `.clm` sources do.
+18. **Developer material** (`dev/`, git-ignored). It is from NE's production,
+    when levels were built in SE1 1.04 (`docs/dev-material.md`):
+    - **Model sources.** 1,049 `.clm` Maya exports, all parsed
+      (`tools/clm.py`).
+    - **Entity classes.** The exact SE1 entity classes the designers used,
+      156 in the GameCube `Entities.dll`, each with every property named
+      and typed, and the enum values, recovered by emulating the DLL's
+      initializers (`tools/se1dll.py`).
+    - **Mapping.** NE's classes map onto them by name and field layout.
+      SoundHolder and MessageHolder are confirmed field for field.
+      TouchField, Bouncer, Camera, LevelPar, FMVPlayer and the rest now
+      have named fields to decode against. The camera markers carry
+      tension, continuity and bias, so NE's camera paths are most likely
+      TCB splines.
